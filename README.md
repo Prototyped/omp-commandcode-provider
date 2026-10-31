@@ -64,7 +64,7 @@ omp --model "commandcode-alpha/moonshotai/Kimi-K2.6" -p "draft a haiku about cac
 
 There is no model list in this extension. At startup the catalog is discovered live from `GET /provider/v1/models?view=client` (public — no auth required): the same versioned CLI catalog the `cmd` CLI consumes, with per-model context windows, output caps, input modalities, reasoning efforts, pricing, and plan gates. The harness caches the discovered catalog across startups; run `omp models refresh` to force a re-fetch.
 
-- **Reasoning/vision** flags, output caps, and context windows all come from the catalog row (`reasoningEfforts`, `inputModalities`, `maxOutputTokens`, `context_length`). A model whose row the catalog schema gate rejects is dropped — the parser is strict on purpose, and an unrecognized catalog shape registers zero models rather than guessing.
+- **Reasoning/vision** flags, output caps, and context windows all come from the catalog row (`reasoningEfforts`, `inputModalities`, `maxOutputTokens`, `context_length`). The parser is strict on purpose: a model whose row the catalog schema gate rejects is dropped, and an unrecognized catalog document (unsupported `schemaVersion` or malformed shape) is a discovery failure rather than a guess.
 - **Plan gating.** Models above the account's plan are dropped at discovery, mirroring the CLI's `evaluateModelAccess`: purchased or free credits bypass the gate; otherwise the model's `minimumPlan` must rank at or below the account plan (`individual-go` → `individual-goat` → `individual-pro` → `individual-provider` → `individual-max` → `individual-ultra`), falling back to a category gate (`opensource` vs `premium`) when no `minimumPlan` is set. Billing is read from `GET /alpha/billing/subscriptions` + `/alpha/billing/credits`; a billing failure fails open (all models kept). Premium-category models therefore only appear on Pro and above.
 - **Hide a model:** list its id under `excludedModels` in `models.yml`:
 
@@ -74,11 +74,11 @@ There is no model list in this extension. At startup the catalog is discovered l
       excludedModels:
         - "Qwen/Qwen3.7-Max"
   ```
-- **If discovery fails** (endpoint down, or its response shape changed), the provider registers with no models — there is deliberately no static fallback to serve stale. `omp models commandcode-alpha` shows nothing until the next startup succeeds, or until `omp models refresh`.
+- **If discovery fails** (endpoint down, or its response shape changed), the failure is reported to the harness, which keeps the catalog from the last successful discovery (a first startup with no cached catalog shows nothing). There is deliberately no static fallback to serve stale. `omp models refresh` forces a re-fetch.
 
 ## How it works
 
-- Resolves the key as `/login` credential → `models.yml` `apiKey` → `COMMANDCODE_API_KEY`, discovers models from the CLI catalog at `GET /provider/v1/models?view=client` (no models if discovery fails), and filters models above the account plan (the CLI's `evaluateModelAccess` port — billing from `/alpha/billing/*`, fail-open on billing failure) plus `models.yml` `excludedModels`
+- Resolves the key as `/login` credential → `models.yml` `apiKey` → `COMMANDCODE_API_KEY`, discovers models from the CLI catalog at `GET /provider/v1/models?view=client` (a discovery failure is thrown so the harness keeps its cached catalog), and filters models above the account plan (the CLI's `evaluateModelAccess` port — billing from `/alpha/billing/*`, fail-open on billing failure) plus `models.yml` `excludedModels`
 - POST `https://api.commandcode.ai/alpha/generate` with `Authorization: Bearer <key>`
 - Body is a wrapped envelope: `{ config, memory, taste, skills, permissionMode, params, threadId }` where `params` carries the actual `{ model, system, messages, tools, max_tokens, stream }`. `threadId` (a strict RFC 4122 UUID, mirrored in the `x-session-id` header) is stable per conversation — the harness `sessionId` when available, else derived deterministically from the working directory, system prompt, and opening message — so the gateway's prompt-cache affinity holds across turns
 - `config`, `memory`, `taste`, and `skills` are static neutral defaults in `index.ts`. A fork that wants Command Code's workspace/taste context can replace `staticConfig()` and those sidecar fields without touching message or stream parsing.
@@ -100,7 +100,7 @@ Reverse-engineered reference for the undocumented endpoint this extension speaks
 
 ## Caveats
 
-- **Discovery is live and uncached here.** The CLI catalog is fetched each startup from the public `GET /provider/v1/models?view=client` (plus the billing endpoints for plan gating when a key is available). If the catalog is unreachable, the provider registers with no models — there is no bundled fallback to serve stale. Run `omp models refresh` to re-fetch.
+- **Discovery is live and uncached here.** The CLI catalog is fetched each startup from the public `GET /provider/v1/models?view=client` (plus the billing endpoints for plan gating when a key is available). If the fetch or its document fails, the failure is reported to the harness, which serves its cached catalog from the last successful discovery (a first startup has nothing cached, so it shows no models) — there is no bundled fallback to serve stale. Run `omp models refresh` to re-fetch.
 - **Undocumented endpoint.** `/alpha/generate` isn't a published API surface. Command Code can change the schema at any time. If they tighten the request shape, expect 400 errors until the extension is updated. For request-schema 400s, first compare the outgoing body in `index.ts` against the current CLI envelope: `config.{workingDir, date, environment, structure, isGitRepo, currentBranch, mainBranch, gitStatus, recentCommits}`, `memory: string`, `taste`, `skills`, `permissionMode`, and `params.{model, system, messages, tools, max_tokens, stream}`.
 - **Tier policy.** This extension uses an endpoint the official CLI uses, on credentials your plan grants. Command Code may consider that fair game or may not; their published "API access" feature still requires the Pro plan. If your account gets flagged or rate-limited, that's the realistic downside.
 - **Vision depends on the model.** Image input comes from the catalog row's `inputModalities`; a row without `image` is text-only.

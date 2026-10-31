@@ -127,16 +127,22 @@ function parseModelRow(row: unknown): CatalogModel | null {
 }
 
 /**
- * Parse a catalog body. Returns an empty array when the schema gate fails
- * (unsupported schemaVersion, missing metadata) — the caller treats that as
- * "no models", never as "guess".
+ * Parse a catalog body. Throws when the document is structurally a catalog
+ * failure (unsupported schemaVersion, missing metadata) — the caller reports
+ * that as a discovery failure so the harness can keep its cached catalog.
+ * Returns the (possibly empty) row list for a structurally valid document;
+ * malformed rows are dropped, never guessed.
  */
 export function parseCatalog(body: unknown): CatalogModel[] {
-	if (!isRecord(body)) return [];
-	if (body.schemaVersion !== CATALOG_SCHEMA_VERSION) return [];
-	if (!isNonEmptyString(body.catalogVersion)) return [];
-	if (!isPositiveInteger(body.refreshAfterSeconds)) return [];
-	if (!Array.isArray(body.data)) return [];
+	if (!isRecord(body)) throw new Error("model catalog is not a JSON object");
+	if (body.schemaVersion !== CATALOG_SCHEMA_VERSION) {
+		throw new Error(`unsupported model catalog schemaVersion ${JSON.stringify(body.schemaVersion)}`);
+	}
+	if (!isNonEmptyString(body.catalogVersion)) throw new Error("model catalog is missing catalogVersion");
+	if (!isPositiveInteger(body.refreshAfterSeconds)) {
+		throw new Error("model catalog is missing a valid refreshAfterSeconds");
+	}
+	if (!Array.isArray(body.data)) throw new Error("model catalog is missing its data array");
 	const models: CatalogModel[] = [];
 	const seen = new Set<string>();
 	for (const row of body.data) {
@@ -146,9 +152,4 @@ export function parseCatalog(body: unknown): CatalogModel[] {
 		models.push(model);
 	}
 	return models;
-}
-
-export function parseCatalogVersion(body: unknown): string | null {
-	if (!isRecord(body)) return null;
-	return isNonEmptyString(body.catalogVersion) ? body.catalogVersion : null;
 }

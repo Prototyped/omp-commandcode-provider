@@ -2,10 +2,10 @@
  * Command Code provider extension for omp.
  *
  * Routes requests through https://api.commandcode.ai/alpha/generate — the
- * endpoint the `cmd` CLI itself uses, which every plan permits. The
- * /provider/v1/* OpenAI/Anthropic-compatible endpoints are Pro-gated and are
- * NOT used; omp's own bundled `commandcode` provider points there, which is
- * why this extension registers under a distinct id.
+ * endpoint the `cmd` CLI itself uses, which every plan permits (the
+ * /provider/v1/* OpenAI/Anthropic-compatible endpoints are Pro-gated). omp's
+ * own bundled `commandcode` provider points at those, which is why this
+ * extension registers under a distinct id.
  *
  * Provider id: commandcode-alpha. Models, capabilities, pricing and plan
  * gates come from the gateway's CLI catalog
@@ -24,10 +24,12 @@
 import type { OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { BASE_URL, COMMAND_CODE_VERSION, PROVIDER_ID } from "./constants.ts";
-import { discoverModels } from "./discovery.ts";
+import { discoverModels, KNOWN_BEHAVIOR_PROFILES } from "./discovery.ts";
 import { evaluateModelAccess, fetchBilling } from "./plan.ts";
 import { streamCommandCode } from "./stream.ts";
 import { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText } from "./update.ts";
+
+let unknownProfiles: string[] = [];
 
 export { parseCatalog } from "./catalog.ts";
 export { readExcludedModels } from "./exclusions.ts";
@@ -78,6 +80,13 @@ export default function (pi: ExtensionAPI) {
 				discoverModels(pi.pi.getAgentDir()),
 				apiKey ? fetchBilling(apiKey, BASE_URL) : Promise.resolve(null),
 			]);
+			const unknown = models.filter((m) => !KNOWN_BEHAVIOR_PROFILES.has(m.behaviorProfile));
+			if (unknown.length > 0) {
+				unknownProfiles = [...new Set(unknown.map((m) => m.behaviorProfile))];
+				console.error(
+					`[commandcode-alpha] unknown behaviorProfile (${unknownProfiles.join(", ")}) — client may be too old`,
+				);
+			}
 			if (!billing || billing.fetchFailed) return models;
 			const kept = models.filter((m) => evaluateModelAccess(billing, m).allowed);
 			const dropped = models.length - kept.length;
@@ -96,12 +105,19 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		void checkCliUpdate(COMMAND_CODE_VERSION)
 			.then((update) => {
-				if (!update?.updateAvailable) return;
-				ctx.ui.setStatus(
-					CLI_UPDATE_STATUS_KEY,
-					cliUpdateStatusText(COMMAND_CODE_VERSION, update.latestVersion),
-				);
+				if (update?.updateAvailable) {
+					ctx.ui.setStatus(
+						CLI_UPDATE_STATUS_KEY,
+						cliUpdateStatusText(COMMAND_CODE_VERSION, update.latestVersion),
+					);
+				}
 			})
 			.catch(() => {});
+		if (unknownProfiles.length > 0) {
+			ctx.ui.setStatus(
+				"commandcode-profile",
+				`Command Code: unknown behaviorProfile (${unknownProfiles.join(", ")}) — the pinned CLI ${COMMAND_CODE_VERSION} may be too old`,
+			);
+		}
 	});
 }

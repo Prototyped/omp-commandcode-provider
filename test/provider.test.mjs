@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-
+import { COMMAND_CODE_VERSION } from "../constants.ts";
+import { getCatalogModelById, hasUnknownBehaviorProfile } from "../discovery.ts";
 import registerCommandCode, {
 	convertMessages,
 	evaluateModelAccess,
@@ -395,7 +396,7 @@ test("rawFinishReason is used when finishReason is absent", async () => {
 });
 
 // ---- Session cost from catalog rates -------------------------------------------
-// The gateway reports usage only; providerMetadata.gateway.cost does not exist.
+// The stream reports usage, not USD; cost is the catalog's pricing rates.
 
 const catalogPricedModel = {
 	...model,
@@ -545,7 +546,19 @@ test("error events surface the gateway message; a bare error gets a generic one"
 		'{"type":"start"}',
 		'{"type":"error","error":{"type":"server_error","message":"model down","statusCode":400}}',
 	]);
-	assert.match(eventsB.at(-1).error.errorMessage, /server_error: model down/);
+	assert.equal(
+		eventsB.at(-1).error.errorMessage,
+		"Command Code stream error: server_error: model down (status 400)",
+	);
+
+	const eventsD = await runStream([
+		'{"type":"start"}',
+		'{"type":"error","error":{"type":"rate_limited","message":"slow down","statusCode":429,"isRetryable":true}}',
+	]);
+	assert.equal(
+		eventsD.at(-1).error.errorMessage,
+		"Command Code stream error: rate_limited: slow down (status 429) [retryable=true]",
+	);
 
 	const eventsC = await runStream(['{"type":"start"}', '{"type":"error"}']);
 	assert.equal(eventsC.at(-1).error.errorMessage, "Command Code stream error: Command Code stream error");
@@ -654,6 +667,7 @@ test("request body is the full /alpha/generate envelope", async () => {
 		stream: true,
 	});
 	assert.equal("temperature" in body.params, false);
+	assert.equal("reasoning_effort" in body.params, false);
 
 	mockFetch(async (_url, init) => {
 		body = JSON.parse(init.body);
@@ -669,6 +683,54 @@ test("request body is the full /alpha/generate envelope", async () => {
 	);
 	assert.equal(body.params.temperature, 0.2);
 	assert.equal(body.params.max_tokens, 1234);
+
+	// reasoning_effort: sent only when the caller asks (and the model reasons),
+	// clamped to the catalog's supported list; never an unlisted value, never
+	// "off" for an explicit effort; disableReasoning maps to "off" when listed.
+	const thinkingModel = { ...model, thinking: { mode: "effort", efforts: ["off", "low", "high", "max"] } };
+	const runReasoning = (opts) =>
+		collect(
+			provider.streamSimple(
+				thinkingModel,
+				{ systemPrompt: "", messages: [], tools: [] },
+				{
+					apiKey: "user_test",
+					...opts,
+				},
+			),
+		).then(() => body.params.reasoning_effort);
+	assert.equal(await runReasoning({ reasoning: "high" }), "high"); // listed, passes through
+	assert.equal(await runReasoning({ reasoning: "minimal" }), "low"); // nearest on-effort (never clamps to off)
+	assert.equal(await runReasoning({ reasoning: "medium" }), "low"); // tie between low/high resolves lower
+	assert.equal(await runReasoning({ reasoning: "xhigh" }), "high"); // nearest below
+	assert.equal(await runReasoning({ disableReasoning: true }), "off"); // listed, sent
+	assert.equal(await runReasoning({}), undefined); // no request, no field
+	// disableReasoning with no "off" in the list is omitted, not sent
+	const noOffModel = { ...model, thinking: { mode: "effort", efforts: ["low", "high"] } };
+	await collect(
+		provider.streamSimple(
+			noOffModel,
+			{ systemPrompt: "", messages: [], tools: [] },
+			{
+				apiKey: "user_test",
+				disableReasoning: true,
+			},
+		),
+	);
+	assert.equal("reasoning_effort" in body.params, false);
+	// a non-reasoning model never gets a reasoning_effort
+	const nonReasoningModel = { ...model, reasoning: false, thinking: { mode: "effort", efforts: ["low"] } };
+	await collect(
+		provider.streamSimple(
+			nonReasoningModel,
+			{ systemPrompt: "", messages: [], tools: [] },
+			{
+				apiKey: "user_test",
+				reasoning: "high",
+			},
+		),
+	);
+	assert.equal("reasoning_effort" in body.params, false);
 
 	// pi-ai hands the system prompt as parts (string[]); the gateway's
 	// params.system schema rejects an array (400 "expected string, received
@@ -851,6 +913,9 @@ test("fetchDynamicModels maps catalog rows to harness models with rates", async 
 	);
 	const flash = models[0];
 	assert.equal(flash.reasoning, true);
+	// The harness reads `thinking.efforts` for the effort picker; without it
+	// the request's reasoning effort can't be clamped to the catalog list.
+	assert.deepEqual(flash.thinking, { mode: "effort", efforts: ["off", "low", "high", "max"] });
 	assert.deepEqual(flash.input, ["text"]);
 	assert.equal(flash.contextWindow, 1_000_000);
 	// null maxOutputTokens clamps to the gateway's hard cap
@@ -858,6 +923,7 @@ test("fetchDynamicModels maps catalog rows to harness models with rates", async 
 	assert.deepEqual(flash.cost, { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 });
 	const kimi = models[1];
 	assert.equal(kimi.reasoning, false);
+	assert.equal(kimi.thinking, undefined);
 	assert.deepEqual(kimi.input, ["text", "image"]);
 	assert.equal(kimi.maxTokens, 131_072);
 });
@@ -883,20 +949,56 @@ test("fetchDynamicModels drops hidden rows and honors excludedModels", async () 
 		models.map((m) => m.id),
 		["moonshotai/Kimi-K3"],
 	);
+	// Hidden rows are excluded from discovery but their catalog records are
+	// kept so a user-supplied id still resolves to real capabilities.
+	const hidden = getCatalogModelById("secret/model");
+	assert.equal(hidden.hidden, true);
+	assert.equal(hidden.contextLength, 1_000_000);
+	assert.deepEqual(hidden.reasoningEfforts, ["off", "low", "high", "max"]);
+	assert.equal(getCatalogModelById("never/listed"), undefined);
 });
 
-test("fetchDynamicModels returns no models when the catalog endpoint fails", async () => {
+test("getCatalogModelById resolves by id or alias from the full catalog", async () => {
+	withAgentDir();
+	discoveryFetch({
+		catalog: () =>
+			catalogBody([
+				catalogRow({ id: "moonshotai/Kimi-K3", hidden: true, aliases: ["kimi-k3"] }),
+				catalogRow({ id: "visible/model" }),
+			]),
+	});
+	await provider.fetchDynamicModels("user_test");
+	const byId = getCatalogModelById("moonshotai/Kimi-K3");
+	assert.equal(byId.hidden, true);
+	assert.equal(byId.aliases.includes("kimi-k3"), true);
+	assert.equal(getCatalogModelById("kimi-k3"), byId); // alias resolves to the same record
+	// The full catalog (not just hidden rows) is the lookup domain.
+	assert.equal(getCatalogModelById("visible/model")?.hidden, false);
+	assert.equal(getCatalogModelById("never/listed"), undefined);
+});
+
+test("catalog fetch failures reject, so the harness keeps its cached catalog", async () => {
 	withAgentDir();
 	discoveryFetch({ catalog: () => new Response("{}", { status: 500 }) });
-	assert.deepEqual(await provider.fetchDynamicModels("user_test"), []);
+	await assert.rejects(provider.fetchDynamicModels("user_test"), /HTTP 500/);
+	mockFetch(async () => {
+		throw new Error("offline");
+	});
+	await assert.rejects(provider.fetchDynamicModels("user_test"), /offline/);
 });
 
-test("fetchDynamicModels returns no models on an unsupported schema version", async () => {
+test("an unsupported schema version rejects, so the harness keeps its cached catalog", async () => {
 	withAgentDir();
 	discoveryFetch({
 		catalog: () =>
 			Response.json({ schemaVersion: 2, catalogVersion: "x", refreshAfterSeconds: 1, data: [catalogRow()] }),
 	});
+	await assert.rejects(provider.fetchDynamicModels("user_test"), /schemaVersion 2/);
+});
+
+test("a valid empty catalog registers no models without reporting a failure", async () => {
+	withAgentDir();
+	discoveryFetch({ catalog: () => catalogBody([]) });
 	assert.deepEqual(await provider.fetchDynamicModels("user_test"), []);
 });
 
@@ -915,6 +1017,103 @@ test("fetchDynamicModels drops malformed rows but keeps good ones", async () => 
 		models.map((m) => m.id),
 		["moonshotai/Kimi-K3"],
 	);
+});
+
+test("catalog fetch uses conditional GET and honors a 304 with the cached body", async () => {
+	withAgentDir();
+	const seenHeaders = [];
+	mockFetch(async (url, init) => {
+		// Billing fetches fail open; only the catalog request is observed here.
+		if (url !== "https://api.commandcode.ai/provider/v1/models?view=client") {
+			throw new Error(`unexpected fetch: ${url}`);
+		}
+		seenHeaders.push(init?.headers ?? {});
+		if (init?.headers?.["if-none-match"] === '"c-cond"') return new Response(null, { status: 304 });
+		return Response.json({
+			schemaVersion: 1,
+			catalogVersion: "c-cond",
+			refreshAfterSeconds: 900,
+			roles: {},
+			data: [catalogRow({ id: "cond/model", context_length: 50_000, maxOutputTokens: 8_192 })],
+		});
+	});
+
+	const first = await provider.fetchDynamicModels("user_test");
+	assert.deepEqual(
+		first.map((m) => m.id),
+		["cond/model"],
+	);
+	// The second call sends the etag back; the 304 answer serves the cached body.
+	const second = await provider.fetchDynamicModels("user_test");
+	assert.equal(seenHeaders.length, 2);
+	assert.equal(seenHeaders[1]["if-none-match"], '"c-cond"');
+	assert.equal(second.length, 1);
+	assert.equal(second[0].id, "cond/model");
+	// Cached rows keep their real capabilities (not a bare etag stub).
+	assert.equal(second[0].contextWindow, 50_000);
+	assert.equal(second[0].maxTokens, 8_192);
+});
+
+test("a user-configured model is augmented from the catalog", async () => {
+	withAgentDir();
+	discoveryFetch({
+		catalog: () =>
+			catalogBody([
+				// Same id as the shared `model` below: a models.yml entry for a
+				// catalog model.
+				catalogRow({
+					inputModalities: ["text", "image"],
+					reasoningEfforts: ["off", "low", "high"],
+					pricing: { inputCost: 1, outputCost: 2, cacheReadCost: 0.1 },
+				}),
+			]),
+	});
+	await provider.fetchDynamicModels("user_test");
+
+	// What the harness passes for a models.yml entry: the id the user wrote,
+	// harness defaults for the rest (text-only, no reasoning, zero rates).
+	const bare = {
+		...model,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+	let body;
+	mockFetch(async (url, init) => {
+		if (!url.includes("/alpha/generate")) throw new Error(`unexpected fetch: ${url}`);
+		body = JSON.parse(init.body);
+		return ndjsonResponse([
+			'{"type":"start"}',
+			'{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":3000,"outputTokens":1000,"cachedInputTokens":2000}}',
+			'{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":3000,"outputTokens":1000,"cachedInputTokens":2000}}',
+		]);
+	});
+	const events = await collect(
+		provider.streamSimple(
+			bare,
+			{
+				systemPrompt: "",
+				messages: [
+					{
+						role: "user",
+						content: [
+							{ type: "text", text: "see" },
+							{ type: "image", data: "AAA=", mimeType: "image/png" },
+						],
+					},
+				],
+				tools: [],
+			},
+			{ apiKey: "user_test", reasoning: "max" },
+		),
+	);
+	// Vision per the catalog: the image rides along instead of being stripped.
+	assert.match(JSON.stringify(body.params.messages), /data:image\/png;base64,AAA=/);
+	// The catalog says the model reasons: effort is sent, clamped to the list.
+	assert.equal(body.params.reasoning_effort, "high");
+	// Catalog rates meter the turn: 1000 uncached in, 2000 cache-read, 1000 out.
+	const cost = events.at(-1).message.usage.cost;
+	assert.ok(Math.abs(cost.total - 0.0032) < 1e-12);
 });
 
 // ---- Plan gating -------------------------------------------------------------------
@@ -1064,6 +1263,146 @@ test("convertMessages moves tool-result image blocks into their own user message
 	assert.equal(out[3].content[0].mediaType, "image/png");
 });
 
+test("convertMessages stripsImages: only the latest image message survives, as a placeholder", () => {
+	const out = convertMessages(
+		[
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "first" },
+					{ type: "image", data: "QQ==", mimeType: "image/png" },
+				],
+			},
+			{ role: "user", content: [{ type: "image", data: "RR==", mimeType: "image/jpeg" }] },
+			{ role: "user", content: "and a text-only message" },
+		],
+		true,
+	);
+	assert.deepEqual(
+		out.map((m) => m.role),
+		["user", "user", "user"],
+	);
+	// Older image-bearing message: image dropped, text kept.
+	assert.deepEqual(out[0].content, [{ type: "text", text: "first" }]);
+	// The latest image-bearing message: placeholder (index counts that message's
+	// content, mediaType preserved for context).
+	assert.deepEqual(out[1].content, [
+		{ type: "text", text: `<attached_image index="0" mediaType="image/jpeg" />` },
+	]);
+	// A text-only message is untouched (string content normalizes to parts).
+	assert.deepEqual(out[2].content, [{ type: "text", text: "and a text-only message" }]);
+});
+
+test("convertMessages stripsImages: an older image-only message is replaced with an omission marker", () => {
+	const out = convertMessages(
+		[
+			{ role: "user", content: [{ type: "image", data: "QQ==", mimeType: "image/png" }] },
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "newer" },
+					{ type: "image", data: "RR==", mimeType: "image/png" },
+				],
+			},
+		],
+		true,
+	);
+	// No text left after the strip -> an explicit marker, not an empty message.
+	assert.deepEqual(out[0].content, [
+		{ type: "text", text: "[image omitted: the active model is text-only]" },
+	]);
+	assert.deepEqual(out[1].content, [
+		{ type: "text", text: "newer" },
+		{ type: "text", text: `<attached_image index="1" mediaType="image/png" />` },
+	]);
+});
+
+test("convertMessages stripsImages: tool-result images follow the same rules", () => {
+	// Latest image lives in a tool result -> placeholder user message, like the
+	// vision path but without the image payload.
+	const out = convertMessages(
+		[
+			{ role: "user", content: "go" },
+			{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "view_image", arguments: {} }] },
+			{
+				role: "toolResult",
+				toolCallId: "c1",
+				toolName: "view_image",
+				isError: false,
+				content: [
+					{ type: "text", text: "img" },
+					{ type: "image", data: "AA==", mimeType: "image/png" },
+				],
+			},
+		],
+		true,
+	);
+	assert.deepEqual(
+		out.map((m) => m.role),
+		["user", "assistant", "tool", "user"],
+	);
+	assert.equal(out[2].content.length, 1);
+	assert.equal(out[2].content[0].output.value, "img");
+	assert.deepEqual(out[3].content, [
+		{ type: "text", text: `<attached_image index="0" mediaType="image/png" />` },
+	]);
+
+	// An earlier tool-result image is replaced with the omission marker inside
+	// its own tool message.
+	const out2 = convertMessages(
+		[
+			{ role: "user", content: "go" },
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "c1", name: "view_image", arguments: {} },
+					{ type: "toolCall", id: "c2", name: "view_image", arguments: {} },
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "c1",
+				toolName: "view_image",
+				isError: false,
+				content: [
+					{ type: "text", text: "old" },
+					{ type: "image", data: "AA==", mimeType: "image/png" },
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "c2",
+				toolName: "view_image",
+				isError: false,
+				content: [
+					{ type: "text", text: "new" },
+					{ type: "image", data: "BB==", mimeType: "image/png" },
+				],
+			},
+		],
+		true,
+	);
+	// Each image-bearing toolResult still gets its own placeholder user message
+	// (the schema has no tool-result image output); older ones carry the
+	// omission marker.
+	assert.deepEqual(
+		out2.map((m) => m.role),
+		["user", "assistant", "tool", "user", "tool", "user"],
+	);
+	assert.deepEqual(out2[2].content, [
+		{ type: "tool-result", toolCallId: "c1", toolName: "view_image", output: { type: "text", value: "old" } },
+	]);
+	assert.deepEqual(out2[3].content, [
+		{ type: "text", text: "[image omitted: the active model is text-only]" },
+	]);
+	assert.deepEqual(out2[4].content, [
+		{ type: "tool-result", toolCallId: "c2", toolName: "view_image", output: { type: "text", value: "new" } },
+	]);
+	assert.deepEqual(out2[5].content, [
+		{ type: "text", text: `<attached_image index="0" mediaType="image/png" />` },
+	]);
+});
+
 test("convertMessages maps a full conversation: strings, images, tool calls, error results, merges", () => {
 	const out = convertMessages([
 		{ role: "user", content: "hi" },
@@ -1124,7 +1463,7 @@ test("convertMessages maps a full conversation: strings, images, tool calls, err
 	]);
 });
 
-test("parseCatalog rejects unsupported schema versions and bad rows", () => {
+test("parseCatalog drops bad and duplicate rows from a valid document", () => {
 	assert.deepEqual(
 		parseCatalog({
 			schemaVersion: 1,
@@ -1150,12 +1489,30 @@ test("parseCatalog rejects unsupported schema versions and bad rows", () => {
 		}).map((m) => m.id),
 		["x/y"],
 	);
+	// A structurally valid document with no rows parses to an empty list —
+	// a successful empty catalog, not a failure.
 	assert.deepEqual(
-		parseCatalog({ schemaVersion: 2, catalogVersion: "x", refreshAfterSeconds: 1, data: [] }),
+		parseCatalog({ schemaVersion: 1, catalogVersion: "x", refreshAfterSeconds: 1, data: [] }),
 		[],
 	);
-	assert.deepEqual(parseCatalog("nope"), []);
-	assert.deepEqual(parseCatalog({}), []);
+});
+
+test("parseCatalog throws on a structurally invalid document", () => {
+	assert.throws(
+		() => parseCatalog({ schemaVersion: 2, catalogVersion: "x", refreshAfterSeconds: 1, data: [] }),
+		/unsupported model catalog schemaVersion 2/,
+	);
+	assert.throws(() => parseCatalog("nope"), /not a JSON object/);
+	assert.throws(() => parseCatalog({}), /schemaVersion/);
+	assert.throws(() => parseCatalog({ schemaVersion: 1, refreshAfterSeconds: 1, data: [] }), /catalogVersion/);
+	assert.throws(
+		() => parseCatalog({ schemaVersion: 1, catalogVersion: "x", data: [] }),
+		/refreshAfterSeconds/,
+	);
+	assert.throws(
+		() => parseCatalog({ schemaVersion: 1, catalogVersion: "x", refreshAfterSeconds: 1 }),
+		/data array/,
+	);
 });
 
 test("readExcludedModels tolerates missing files and bad yaml", async () => {
@@ -1256,4 +1613,39 @@ test("session_start paints the status line only when the pin is stale", async ()
 	await handlers.get("session_start")({}, ctx);
 	await settle();
 	assert.deepEqual(statuses, []);
+});
+
+// ---- Unknown behaviorProfile (the CLI's "client too old" verdict) --------------
+
+test("hasUnknownBehaviorProfile flags profiles outside the pinned CLI's set", () => {
+	assert.equal(hasUnknownBehaviorProfile([]), false);
+	assert.equal(hasUnknownBehaviorProfile([{ behaviorProfile: "standard-v1" }]), false);
+	assert.equal(
+		hasUnknownBehaviorProfile([
+			{ behaviorProfile: "standard-v1" },
+			{ behaviorProfile: "anthropic-prefix-bound-v1" },
+		]),
+		false,
+	);
+	assert.equal(hasUnknownBehaviorProfile([{ behaviorProfile: "brand-new-v2" }]), true);
+});
+
+test("an unknown behaviorProfile in the catalog sets a status line at session start", async () => {
+	withAgentDir();
+	discoveryFetch({
+		catalog: () => catalogBody([catalogRow({ behaviorProfile: "brand-new-v2" })]),
+	});
+	// Billing fetches are not mocked; the fail-open path keeps the model.
+	await provider.fetchDynamicModels("user_test");
+
+	const statuses = [];
+	const ctx = { ui: { setStatus: (key, text) => statuses.push([key, text]) } };
+	// dist-tags mocked at the pinned version so only the profile notice fires.
+	mockFetch(async () => distTags({ latest: COMMAND_CODE_VERSION }));
+	await handlers.get("session_start")({}, ctx);
+	assert.equal(statuses.length, 1);
+	const [key, text] = statuses[0];
+	assert.equal(key, "commandcode-profile");
+	assert.match(text, /brand-new-v2/);
+	assert.match(text, new RegExp(COMMAND_CODE_VERSION.replace(/\./g, "\\.")));
 });

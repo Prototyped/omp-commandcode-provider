@@ -6,6 +6,17 @@ against v1.88.2) and
 confirmed against the live gateway. Treat it as a snapshot that can drift —
 when it breaks, re-derive from the current CLI bundle (`$(npm root -g)/command-code/dist/cli.mjs`).
 
+**Scope.** This document describes the **wire protocol** between the Command
+Code CLI (the pinned release, `COMMAND_CODE_VERSION` in `constants.ts`) and
+the provider's endpoints at `api.commandcode.ai`: the requests sent, the
+responses and NDJSON stream received, and the shape of the catalog document.
+CLI behavior that does not change what goes on the wire — local catalogs and
+caches, picker and runner decisions, npm version checks — is out of scope, as
+is the extension's implementation. The extension's code may be referenced
+here **only** where it changes the wire payload relative to the CLI, and every
+such reference is marked as one ("Divergence (extension):"). Do not add
+sections that merely describe local behavior, of the CLI or the extension.
+
 ## Why this endpoint (and not `/provider/v1/*`)
 
 The gateway exposes three model-traffic surfaces:
@@ -38,24 +49,40 @@ instead of a standard OpenAI/Anthropic shape.
 https://api.commandcode.ai
 ```
 
-The CLI also supports `--local` (`http://localhost:9090`) and `--staging`
-(`https://staging-api.commandcode.ai`); not relevant here.
+The CLI can also be pointed at `--local` (`http://localhost:9090`) and
+`--staging` (`https://staging-api.commandcode.ai`); the default is above.
 
-### Other endpoints the extension touches
+### Other endpoints of the protocol
 
-| Path                                  | Purpose                                                                                                                                |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /alpha/whoami`                   | `/login commandcode-alpha` validates the pasted key here, mirroring the CLI; a 401 rejects the key, 403/unreachable keeps it           |
-| `GET /provider/v1/models?view=client` | the CLI model catalog discovery reads at startup (public — answers unauthenticated); no static fallback in `index.ts` when unavailable |
-| `GET /alpha/billing/subscriptions`    | the account plan (`data.planId`) plan gating filters against                                                                           |
-| `GET /alpha/billing/credits`          | credit balances; purchased/free credits bypass the plan gate (see also `docs/caching.md`)                                              |
+| Path                                  | Purpose                                                                                             |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `GET /alpha/whoami`                   | key validation, as the CLI's login does it: only a 401 rejects the key; 403 or unreachable keeps it |
+| `GET /provider/v1/models?view=client` | the CLI model catalog, fetched at startup (public — answers unauthenticated)                        |
+| `GET /alpha/billing/subscriptions`    | the account plan (`data.planId`) plan gating filters against                                        |
+| `GET /alpha/billing/credits`          | credit balances; purchased/free credits bypass the plan gate (see also `docs/caching.md`)           |
 
 The plain `GET /provider/v1/models` (no query) answers unauthenticated with a
-minimal OpenAI-style list (`id`, `name`, `context_length`, `supported_endpoints`
-only) — the extension does not use it. `GET /alpha/lifecycle-events` is not
-used either. Neither is a staleness signal: the router serves the identical
-catalog body whatever `x-command-code-version` says, and it has no version
-endpoint (`GET /versions` is 404).
+minimal OpenAI-style list (`id`, `name`, `context_length`,
+`supported_endpoints` only) — not the CLI's catalog. `GET /alpha/lifecycle-events`
+exists but is not part of the model-traffic surface. Neither is a staleness
+signal: the router serves the identical catalog body whatever
+`x-command-code-version` says, and it has no version endpoint
+(`GET /versions` is 404).
+
+The `?view=client` document carries a `catalogVersion` (a content hash, e.g.
+`f3a51355…` as of 2026-10-31), and the gateway honors conditional GET on it:
+a request with `if-none-match: "<catalogVersion>"` gets a bare `304` when the
+document is unchanged, which is how the CLI revalidates its catalog
+(live-verified 2026-10-31).
+
+Catalog rows may carry `hidden: true` (12 such rows as of 2026-10-31); hidden
+rows are otherwise complete — same capabilities, pricing, plan gates.
+Divergence (extension): a model selected through `models.yml` carries only
+the id the user wrote, so the extension looks that id up in the fetched
+catalog and takes the wire-relevant fields from the row — `inputModalities`
+(drives image stripping, see Messages) and `reasoningEfforts` (drives
+`reasoning_effort` clamping, see Request); a configured model without a rate
+card also takes the row's `pricing` for cost metering.
 
 There is, however, a real gateway-side gate — a **floor**, not a ceiling.
 `/alpha/generate` validates `x-command-code-version` and rejects anything below
@@ -77,34 +104,14 @@ header is a deprecation floor, not a protocol check. `GET /alpha/whoami` and
 `GET /provider/v1/models` ignore it.
 
 The header value is the npm **package version** — the CLI derives it from its
-own `package.json` — so the extension's pin is directly comparable to the npm
-release, which is what `update.ts` relies on.
+own `package.json` — so the pin `COMMAND_CODE_VERSION` is directly comparable
+to an npm release. (The extension's staleness notices built on that fact are
+local behavior, not wire protocol; see `docs/troubleshooting.md`.)
 
-The CLI's own notion of "this client is too old for the _protocol_" is purely
-local: its catalog parser maps an unknown `behaviorProfile` onto
-`client-update-required`. That, plus npm's published version, is what
-`update.ts` uses (see "Staleness notice" below).
-
-### Staleness notice
-
-`COMMAND_CODE_VERSION` is a protocol pin, not an install dependency: a newer
-`command-code` release means the envelope in this document may have drifted.
-At `session_start` the extension asks npm for the newest **stable** release and,
-when the pin is behind, sets the status-line entry `commandcode-cli`
-(`ctx.ui.setStatus`) to `Command Code <latest> released · pin <old> stale`.
-
-This mirrors the CLI's own updater rather than inventing a new source: in the
-1.88.2 bundle `fetchVersions` shells out to `npm view command-code versions
---json`, `isPrereleaseVersion` drops prereleases, `getLatestVersion` takes the
-semver maximum, and `determineUpdateTarget` compares it with the CLI's own
-version. `update.ts` asks npm's dist-tags document instead of the full
-packument (~90 bytes versus ~1.2 MB) and applies the same prerelease filter and
-semver max; `latest` advances with every stable publish, so the two agree.
-
-The check is detached (the harness awaits `session_start` handlers) and
-advisory: an unreachable registry, a non-200, an unparseable body, or a null
-result paints nothing. It also fetches nothing from `api.commandcode.ai`, so it
-works before login and does not depend on the key.
+Catalog rows carry a `behaviorProfile` — a behavior string the CLI codes
+against. The pinned CLI's known set is listed in `AGENTS.md`'s validation map;
+a catalog value outside it means the catalog has moved ahead of the pin (the
+CLI treats that as "client too old").
 
 ## Request
 
@@ -121,13 +128,14 @@ x-session-id: <uuid>
 x-cmd-zdr: 1
 ```
 
-`x-session-id` is a stable per-conversation UUID (the CLI uses its session's
-`crypto.randomUUID()`; the extension uses the harness `sessionId` when it is
-UUID-shaped, else a deterministic UUID derived from the working directory,
-system prompt, and opening user message). The same value is sent as the body's
-`threadId`; the gateway validates it as a strict RFC 4122 UUID. It keys the
-gateway's session state and prompt-cache affinity, so it must not change
-mid-conversation.
+`x-session-id` is a stable per-conversation UUID, sent with the same value as
+the body's `threadId`; the gateway validates it as a strict RFC 4122 UUID. It
+keys the gateway's session state and prompt-cache affinity, so it must not
+change mid-conversation. The CLI's is its session's `crypto.randomUUID()` —
+fresh per CLI session. Divergence (extension): the value is the harness
+`sessionId` when it is UUID-shaped, else a deterministic UUID derived from the
+working directory, system prompt, and opening user message, so the same
+conversation keeps one id across harness restarts.
 
 Body:
 
@@ -159,6 +167,7 @@ Body:
 		],
 		"max_tokens": 32000,
 		"temperature": 0.7, // optional
+		"reasoning_effort": "high", // optional; snake_case; see the note under the envelope
 		"stream": true // always true in practice
 	},
 	"threadId": "<uuid>" // same value as the x-session-id header
@@ -168,10 +177,22 @@ Body:
 The CLI also sends top-level `mode` (a use-mode string such as
 `"custom-agent"` for subagent turns) and `promptCache` (`"off"` on its
 internal side-requests); both are optional — the gateway accepts the body
-without them, which is what the extension sends. `params.reasoning_effort` is
-the CLI's per-turn effort selection (snake_case, sent only for thinking models
-with an explicit effort); the extension omits it and the model runs at its
-default effort.
+without them, which is what the extension sends.
+
+`params.reasoning_effort` (snake_case) is the per-turn effort selection. The
+CLI sends the user's pick verbatim and only picks it from the catalog's
+`reasoningEfforts` filtered through its own effort vocabulary
+(`off | low | medium | high | xhigh | max` — 1.88.2 `Vr` set), so the CLI
+never sends an unlisted value. The gateway, however, _does_ accept unlisted
+values — and silently disables reasoning when it gets one (measured
+2026-10-31). Divergence (extension): the harness's effort scale also has
+`minimal` and is not constrained per model, so the extension clamps to the
+catalog list before sending — nearest by rank (`off < minimal < low < medium
+< high < xhigh < max`), a tie resolving to the _lower_ effort. An explicit
+effort never clamps to `"off"` (a reasoning request that silently disabled
+reasoning would be worse than a slightly under-thinked one); `"off"` is sent
+only for `disableReasoning`, and only when the model lists it. A model whose
+id the catalog doesn't know passes the requested value through.
 
 ### The `config` envelope is schema-strict
 
@@ -185,9 +206,7 @@ expected array, received undefined at "config.structure"; …
 
 The values are not load-bearing for routing — the gateway just splices them
 into the system-prompt preamble. Neutral defaults (empty strings / arrays /
-`isGitRepo:false`) work fine. A fork that wants real project context (for
-Command Code's "taste" subsystem) populates them for real; see `staticConfig()`
-in `index.ts`.
+`isGitRepo:false`) work fine, which is what the sample envelope above sends.
 
 ### `params.system` must be a string
 
@@ -200,10 +219,9 @@ Validation error: Invalid input: expected string, received array at "params.syst
 or Invalid input: expected object, received string at "params.system[0]"
 ```
 
-The harness (pi-ai) hands the system prompt as parts — `Context.systemPrompt`
-is `string[]` — so `systemPromptText()` in `session.ts` joins them with
-`\n\n` before sending. The session-id seed uses the same canonicalization so
-both prompt forms keep one identity.
+Divergence (extension): the harness's system prompt arrives as parts
+(`Context.systemPrompt` is `string[]`), so it is joined with `\n\n` into the
+single string the wire requires before sending.
 
 ### Messages use the Vercel AI SDK `ModelMessage` schema
 
@@ -241,17 +259,27 @@ The three message roles:
   turns. Most reasoning models preserve it server-side, but some (e.g.
   `reflection/beam:free`) 400 with
   `Missing required parameter: 'messages[N].reasoning_content'` when an
-  earlier turn's reasoning is not sent back. The CLI sends the parts on every
-  turn, and so does the extension.
+  earlier turn's reasoning is not sent back — the CLI sends the parts on
+  every turn regardless.
 - Tool result `output` is `{ "type": "text", "value": "…" }` (or
   `{ "type": "error-text", "value": "…" }`), **not** a raw string.
 - `toolCallId` / `toolName` (camelCase, hyphen in `tool-call` / `tool-result`),
   not Anthropic's `tool_use` / `tool_use_id` / `id`.
 - Consecutive tool results merge into one `role:"tool"` message.
-- There is no image output for tool results (the CLI does the same): image
-  blocks that accompany a tool result ride back as their own `role:"user"`
-  message with `image` content parts, immediately after the `role:"tool"`
-  message.
+- There is no image output for tool results: the CLI rides image blocks that
+  accompany a tool result back as their own `role:"user"` message with
+  `image` content parts, immediately after the `role:"tool"` message.
+- Divergence (extension): for a model whose catalog `inputModalities` lack
+  `"image"` (the harness default for user-configured entries is text-only —
+  see the hidden-row note above), image payloads are not sent at all. Only
+  the _latest_ image-bearing message keeps a stand-in — the image block
+  becomes the text part `<attached_image index="N" mediaType="M" />` (N is
+  the block's position in that message's content) — and an image-only older
+  message is replaced with
+  `[image omitted: the active model is text-only]` so the history never
+  contains an empty turn. Image blocks on tool results follow the same rule:
+  their follow-on `role:"user"` message carries the placeholder (latest) or
+  the omission marker (older) instead of `image` parts.
 
 ### Tools
 
@@ -323,12 +351,15 @@ Event sequence for a typical tool-using turn:
 | `finish`             | `finishReason`, `totalUsage`              | finalizes `done`                                 |
 | `cache-write-tokens` | `cacheWriteTokens`                        | patches `cacheWrite` when `finish` reported none |
 | `provider-metadata`  | `providerMetadata` (routing-specific)     | anthropic 1h cache-write split                   |
-| `error`              | `error` or `message`                      | `error`                                          |
+| `error`              | `error` object or top-level `message`     | `error`                                          |
 
 **Gotcha:** the per-delta tool events use field **`id`**, but the final
 redundant `tool-call` event uses **`toolCallId`**. If you key everything off
-`id` you'll silently miss the `tool-call` event. `index.ts` resolves
-`id ?? toolCallId` and dedupes so a doubled end event can't fire twice.
+`id` you'll silently miss the `tool-call` event; resolve `id ?? toolCallId`.
+
+The `error` event's `error` object carries `{ type, message, statusCode,
+isRetryable }` (all optional), or a top-level `message`. A truncated stream
+(no terminal `finish`/`finish-step`) is a wire error in itself.
 
 `finishReason` observed values: `"stop"`, `"length"`, `"tool-calls"`.
 Current streams commonly contain both `finish-step` and `finish`; consumers
@@ -356,39 +387,26 @@ must emit one terminal result and reject EOF if neither event arrives.
 }
 ```
 
-**Important for cost math:** `inputTokens` is the _total_ including cached
-tokens, following the Vercel AI SDK convention. The harness's `Usage` shape expects
-`input` and `cacheRead` to be **disjoint** (it computes
-`totalTokens = input + output + cacheRead + cacheWrite` and bills each
-separately). So the extension does `input = inputTokens - cachedInputTokens`.
-See `docs/caching.md`.
+Field semantics: `inputTokens` is the _total_ including cached tokens,
+following the Vercel AI SDK convention. A consumer that meters per-bucket
+cost must first apply the `input = inputTokens - cachedInputTokens`
+reduction to reach disjoint buckets (the bucket math and its effect on
+metering are in `docs/caching.md`).
 
 ### `providerMetadata` (in `finish-step` / terminal `provider-metadata`)
 
 Which keys appear depends on how the gateway routed the call: Vercel AI
 Gateway routing carries `gateway` metadata (routing, `generationId`); a direct
 upstream carries its own key (e.g. `novita` with prediction-token stats). The
-extension reads exactly one key out of `providerMetadata`:
+Anthropic 1-hour cache-write split arrives as
 `anthropic.usage.cache_creation.ephemeral_1h_input_tokens` on a terminal
-`provider-metadata` event — the Anthropic 1-hour cache-write split.
+`provider-metadata` event.
 
-### Cost
+### No per-request USD on the wire
 
-The gateway reports usage but no per-request USD. The extension computes cost
-locally from the catalog's `pricing` rates (USD per 1M tokens, carried onto
-each discovered model):
-
-```
-cost = (uncachedInput × input + output × output
-        + cacheRead × cacheRead + cacheWrite × cacheWrite) / 1_000_000
-```
-
-`uncachedInput` is `inputTokens` minus the cache-read and cache-write tokens
-(the usage buckets are disjoint, see above). `cacheWrite` comes from
-`inputTokenDetails.cacheWriteTokens` on the terminal `usage`, is patched by
-the `cache-write-tokens` event when that reported 0, and the 1-hour split is
-folded in when it exceeds the reported total. The result lands in
-`usage.cost` (per-bucket USD plus `total`, which the session meter reads).
-These are the catalog's market rates; the Go plan's per-model credit
-multipliers are not applied, so the metered number is an upstream-cost
-estimate, not what the account is debited.
+The stream reports usage, not money: no endpoint or event carries a per-turn
+charge. Any USD number the harness shows is a local computation from the
+catalog's `pricing` rates (USD per 1M tokens) over the turn's usage — see
+`docs/caching.md` for the bucket math and the README for what the meter does
+and does not measure (it estimates upstream cost; the plan's per-model credit
+multipliers are not applied).

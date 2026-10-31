@@ -4,9 +4,7 @@
  * The Command Code CLI's own updater (`fetchVersions` / `getLatestVersion` /
  * `determineUpdateTarget` in the 1.88.2 bundle) asks npm for the package's
  * published versions (`npm view command-code versions --json`), drops
- * prereleases, and compares the semver maximum against its own version. Its
- * `/alpha/lifecycle-events` and model-catalog calls play no part in that, and
- * the router exposes no version endpoint of its own.
+ * prereleases, and compares the semver maximum against its own version.
  *
  * This module mirrors that check against npm's dist-tags document instead of
  * the full packument (whose abbreviated form is ~1.2 MB): the same "newest

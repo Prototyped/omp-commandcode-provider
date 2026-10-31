@@ -89,6 +89,24 @@ That is the cue to re-derive the protocol from the new bundle (see
 `AGENTS.md`). No warning means npm could not be reached or the pin is current —
 the check is advisory and never blocks startup.
 
+The check is the CLI's own updater, not an api.commandcode.ai call (`update.ts`
+mirrors the 1.88.2 bundle's `fetchVersions`/`getLatestVersion`/
+`determineUpdateTarget`: `npm view command-code versions --json`, drop
+prereleases, semver max). `update.ts` asks npm's dist-tags document instead of
+the full packument (~90 bytes versus ~1.2 MB) and applies the same prerelease
+filter and semver max; `latest` advances with every stable publish, so the two
+agree. It runs detached at `session_start` (the harness awaits those
+handlers), fetches nothing from the gateway, and works before login.
+
+A second notice does not depend on npm: when the fetched catalog contains a
+model with a `behaviorProfile` outside the pinned CLI's known set (the set is
+listed in `AGENTS.md`'s validation map — the CLI's own "this client is too old"
+verdict, 1.88.2 `clientUpdateReason`), `index.ts` records the offending
+profiles at discovery and, at the next `session_start`, sets the status-line
+entry `commandcode-profile` to `Command Code: unknown behaviorProfile
+(<profiles>) — the pinned CLI <version> may be too old`. It fires even when the
+npm version is current.
+
 ### Missing `config` fields
 
 ```
@@ -183,11 +201,10 @@ curl -sS https://api.commandcode.ai/alpha/billing/credits \
 Note the Go plan's per-model multipliers stretch the nominal $10 a long way on
 DeepSeek / MiMo / Qwen — but reasoning-heavy models burn output tokens fast.
 
-## `Error: [object Object]`
+## Debugging stream errors
 
-Old symptom (fixed). Was a non-`Error` throwable getting `String()`-ed. If you
-ever see it again, run with `DEBUG=1` — the extension logs the raw error object
-to stderr:
+Run with `DEBUG=1` to have the extension log the raw stream error object to
+stderr:
 
 ```bash
 DEBUG=1 omp --model "commandcode-alpha/deepseek/deepseek-v4-pro" -p "test" 2>&1 \
@@ -219,3 +236,25 @@ The canonical model id list is always:
 curl -sS https://api.commandcode.ai/provider/v1/models \
   -H "Authorization: Bearer $COMMANDCODE_API_KEY"
 ```
+
+## Stream error codes (`/alpha/generate`)
+
+The stream's `error` event carries `{type, message, statusCode, isRetryable}`.
+Each code means a different user action:
+
+| `type` / code                         | Cause                                                                           | Action                                                                                                                                        |
+| ------------------------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MODEL_NOT_IN_PLAN`                   | Model above the account's plan                                                  | Pick a model the plan includes; the extension drops these at discovery, so this usually means a stale picker cache — run `omp models refresh` |
+| `RATE_LIMITED`                        | Free-tier quota exhausted (e.g. `inclusionai/ling-3.1-flash-1019:free`)         | Switch to the paid id, or wait for the quota reset                                                                                            |
+| `CMD_ZDR_NO_PROVIDERS`                | A `zdr: false` model (e.g. `meta/muse-spark-1.3-contributor`) under `CMD_ZDR=1` | Unset `CMD_ZDR` or pick a ZDR-capable model                                                                                                   |
+| `Model '…' not found`                 | Dead id (e.g. `poolside/laguna-s-2.1-free`) or a gateway-side rewrite           | Remove from `models.yml`; `omp models refresh`                                                                                                |
+| (truncated stream, no terminal event) | Network drop or gateway crash mid-stream                                        | Retry; the harness owns retry/fallback                                                                                                        |
+
+## Hidden models
+
+Rows with `hidden: true` in the catalog are filtered out of discovery (they do
+not appear in the picker). They are still parsed with full capability data, so
+a user who manually adds a hidden id to `models.yml` (with an `apiKey` or
+`auth: none` beside it) gets real capabilities instead of defaults. Hidden
+models that are also dead upstream (`poolside/laguna-s-2.1-free`) are a
+gateway-side condition — nothing the extension can prevent.

@@ -40,26 +40,64 @@ type CmdMessage =
 	| { role: "assistant"; content: AssistantContent[] }
 	| { role: "tool"; content: ToolContent[] };
 
-export function convertMessages(messages: Message[]): CmdMessage[] {
+export function convertMessages(messages: Message[], textOnly = false): CmdMessage[] {
 	const out: CmdMessage[] = [];
 	// Track tool call names by id so tool-result messages can fill `toolName`
 	const toolNameById = new Map<string, string>();
 
-	for (const msg of messages) {
+	// For text-only models: find the index of the last message (user or toolResult)
+	// that carries images, so only that one keeps image placeholders.
+	let lastImageMsgIdx = -1;
+	if (textOnly) {
+		for (let i = 0; i < messages.length; i++) {
+			const m = messages[i];
+			if (
+				m.role === "user" &&
+				Array.isArray(m.content) &&
+				m.content.some((b: { type?: string }) => b.type === "image")
+			) {
+				lastImageMsgIdx = i;
+			} else if (
+				m.role === "toolResult" &&
+				Array.isArray(m.content) &&
+				m.content.some((b: { type?: string }) => b.type === "image")
+			) {
+				lastImageMsgIdx = i;
+			}
+		}
+	}
+
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i];
 		if (msg.role === "user") {
 			const content: UserContent[] = [];
+			const hasImages =
+				Array.isArray(msg.content) && msg.content.some((b: { type?: string }) => b.type === "image");
+			const isLastImage = textOnly && i === lastImageMsgIdx;
 			if (typeof msg.content === "string") {
 				content.push({ type: "text", text: msg.content });
 			} else {
 				for (const block of msg.content) {
 					if (block.type === "text") content.push({ type: "text", text: block.text });
-					else if (block.type === "image")
-						content.push({
-							type: "image",
-							image: `data:${block.mimeType};base64,${block.data}`,
-							mediaType: block.mimeType,
-						});
+					else if (block.type === "image") {
+						if (!textOnly) {
+							content.push({
+								type: "image",
+								image: `data:${block.mimeType};base64,${block.data}`,
+								mediaType: block.mimeType,
+							});
+						} else if (isLastImage) {
+							content.push({
+								type: "text",
+								text: `<attached_image index="${content.length}" mediaType="${block.mimeType}" />`,
+							});
+						}
+						// else: drop the image (older message)
+					}
 				}
+			}
+			if (content.length === 0 && hasImages && textOnly) {
+				content.push({ type: "text", text: "[image omitted: the active model is text-only]" });
 			}
 			if (content.length > 0) out.push({ role: "user", content });
 		} else if (msg.role === "assistant") {
@@ -103,7 +141,27 @@ export function convertMessages(messages: Message[]): CmdMessage[] {
 			}
 			// The ModelMessage schema has no image output for tool results — the
 			// CLI does the same: image blocks ride back as their own user message.
-			if (images.length > 0) out.push({ role: "user", content: images });
+			if (images.length > 0) {
+				if (!textOnly) {
+					out.push({ role: "user", content: images });
+				} else {
+					const isLastImage = i === lastImageMsgIdx;
+					const imgContent: UserContent[] = [];
+					if (isLastImage) {
+						images.forEach((img, idx) => {
+							const mt = (img as { mediaType?: string }).mediaType ?? "image";
+							imgContent.push({
+								type: "text",
+								text: `<attached_image index="${idx}" mediaType="${mt}" />`,
+							});
+						});
+					}
+					if (imgContent.length === 0) {
+						imgContent.push({ type: "text", text: "[image omitted: the active model is text-only]" });
+					}
+					out.push({ role: "user", content: imgContent });
+				}
+			}
 		}
 	}
 	return out;

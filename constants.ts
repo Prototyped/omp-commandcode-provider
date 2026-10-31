@@ -8,8 +8,8 @@ export const BASE_URL = "https://api.commandcode.ai";
 // access" for models this extension serves fine over /alpha/generate.
 export const PROVIDER_ID = "commandcode-alpha";
 export const MODELS_ENDPOINT = "/provider/v1/models";
-// `view=client` returns the CLI's model catalog: capabilities, pricing, plan
-// gates and aliases — everything models.dev used to approximate.
+// `view=client` returns the CLI's model catalog: per-model capabilities,
+// pricing, plan gates and aliases.
 export const CATALOG_ENDPOINT = `${MODELS_ENDPOINT}?view=client`;
 export const ENDPOINT = "/alpha/generate";
 // Mirrors the `x-command-code-version` the CLI sends (its package version).

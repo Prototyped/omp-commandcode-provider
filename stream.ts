@@ -17,6 +17,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { BASE_URL, COMMAND_CODE_VERSION, ENDPOINT, PROVIDER_ID } from "./constants.ts";
+import { getCatalogModelById } from "./discovery.ts";
 import { convertMessages } from "./messages.ts";
 import { deriveSessionId, systemPromptText } from "./session.ts";
 
@@ -79,7 +80,6 @@ async function* ndjsonLines(body: ReadableStream<Uint8Array>): AsyncGenerator<un
 //   usage:      `usage` on finish-step, `totalUsage` on finish
 //   cache-read: `cachedInputTokens`, `inputTokenDetails.cacheReadTokens`,
 //               and `raw.prompt_cache_hit_tokens` all carry the same number
-//   cost:       `providerMetadata.gateway.cost` and `.inferenceCost`
 // DEFENSIVE — not seen in the observed flow; prune when drift is confirmed:
 //   `name` (tool name), `args` (tool input), `input_tokens`/`output_tokens`,
 //   finish reason `tool_use`
@@ -95,8 +95,6 @@ function toolEventName(event: GatewayEvent): string {
 	return event.toolName ?? event.name ?? "";
 }
 
-// The gateway reports costs as strings in current flows ("0.000065598");
-// older or third-party gateways may send numbers. Accept both, reject junk.
 // ---- Request construction -------------------------------------------------
 
 // The /alpha/generate schema is strict — all of these fields are required.
@@ -150,6 +148,35 @@ function requestHeaders(apiKey: ApiKey, sessionId: string): Record<string, strin
 	};
 }
 
+// A user-configured model (models.yml) carries the id the user wrote and
+// harness defaults for the rest (text-only input, no reasoning, zero rates).
+// Hidden catalog rows never reach discovery, so without this lookup the wire
+// shape would be wrong for them: images stripped from a vision model, an
+// unlisted reasoning_effort sent (silently disabling reasoning), cost metered
+// at zero. Discovered models already carry the catalog's data, so the
+// augmentation is idempotent for them.
+function augmentFromCatalog(model: Model<Api>): Model<Api> {
+	const row = getCatalogModelById(model.id);
+	if (!row) return model;
+	const patch: Record<string, unknown> = {
+		input: row.inputModalities.includes("image") ? ["text", "image"] : ["text"],
+	};
+	if (row.reasoningEfforts.length > 0) {
+		patch.reasoning = true;
+		patch.thinking = { mode: "effort", efforts: row.reasoningEfforts };
+	}
+	const { input, output, cacheRead, cacheWrite } = model.cost;
+	if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0 && row.pricing) {
+		patch.cost = {
+			input: row.pricing.inputCost,
+			output: row.pricing.outputCost,
+			cacheRead: row.pricing.cacheReadCost,
+			cacheWrite: row.pricing.cacheWriteCost ?? 0,
+		};
+	}
+	return { ...model, ...patch } as Model<Api>;
+}
+
 function requestBody(
 	model: Model<Api>,
 	context: Context,
@@ -161,6 +188,50 @@ function requestBody(
 		description: t.description,
 		input_schema: t.parameters,
 	}));
+	// Reasoning effort: clamp to the model's supported list (catalog
+	// `reasoningEfforts`). Never send an unlisted value — the gateway accepts
+	// it and silently disables reasoning (measured 2026-10-31). `disableReasoning`
+	// maps to "off" only when the model lists it; an explicit effort never
+	// clamps to "off" (a tie between two on-efforts resolves to the lower one).
+	const modelExt = model as unknown as { thinking?: { efforts?: string[] }; reasoningEfforts?: string[] };
+	const efforts: string[] = modelExt.thinking?.efforts ?? modelExt.reasoningEfforts ?? [];
+	const textOnly = !(model.input?.includes?.("image") ?? false);
+	const effortRank: Record<string, number> = {
+		off: -1,
+		minimal: 0,
+		low: 1,
+		medium: 2,
+		high: 3,
+		xhigh: 4,
+		max: 5,
+	};
+	let reasoningEffort: string | undefined;
+	if (options?.disableReasoning) {
+		if (efforts.includes("off")) reasoningEffort = "off";
+	} else if (options?.reasoning && model.reasoning) {
+		const requested = String(options.reasoning);
+		if (efforts.includes(requested)) {
+			reasoningEffort = requested;
+		} else if (efforts.length > 0) {
+			const reqRank = effortRank[requested] ?? 2;
+			let best: string | null = null;
+			let bestDist = Infinity;
+			for (const e of efforts) {
+				if (e === "off") continue;
+				const dist = Math.abs((effortRank[e] ?? 2) - reqRank);
+				if (dist < bestDist || (dist === bestDist && effortRank[e] < effortRank[best as string])) {
+					bestDist = dist;
+					best = e;
+				}
+			}
+			reasoningEffort = best ?? undefined;
+		} else {
+			// No catalog list (user-configured model): pass the requested
+			// value through rather than guessing.
+			reasoningEffort = requested;
+		}
+	}
+
 	return {
 		config: staticConfig(),
 		memory: "",
@@ -170,10 +241,11 @@ function requestBody(
 		params: {
 			model: model.id,
 			system: systemPromptText(context.systemPrompt),
-			messages: convertMessages(context.messages),
+			messages: convertMessages(context.messages, textOnly),
 			tools,
 			max_tokens: options?.maxTokens ?? model.maxTokens ?? 8192,
 			...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
+			...(reasoningEffort !== undefined ? { reasoning_effort: reasoningEffort } : {}),
 			stream: true,
 		},
 		threadId: sessionId,
@@ -389,13 +461,11 @@ function applyUsage(usage: AssistantMessage["usage"], raw: GatewayUsage): void {
 	usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
-// The gateway reports usage only — `providerMetadata.gateway.cost` /
-// `.inferenceCost` were never observed on any stream (contrary to earlier
-// revisions of docs/wire-protocol.md) — so cost comes from the catalog's
-// `pricing` rates carried on the model, the same math 1.88.2 performs
-// (`estimateCatalogCostUsd`). Verified live for deepseek/deepseek-v4-flash
-// (inputCost 0.15, outputCost 0.6, cacheReadCost 0.003): a cold 762-in/1-out
-// call prices at $1.149e-4; with 512 cache-read tokens at $3.964e-5.
+// The stream reports usage, not USD, so cost is the catalog's `pricing`
+// rates — the same math 1.88.2 performs (`estimateCatalogCostUsd`).
+// Verified live: deepseek/deepseek-v4-flash (inputCost 0.15, outputCost 0.6,
+// cacheReadCost 0.003) prices a cold 762-in/1-out call at $1.149e-4, and
+// $3.964e-5 with 512 cache-read tokens.
 function computeCost(model: Model<Api>, usage: AssistantMessage["usage"]): number {
 	// `usage.cost` holds USD amounts (the harness meter reads `.total`); the
 	// per-million rates live on the discovered model, not the message.
@@ -410,8 +480,8 @@ function computeCost(model: Model<Api>, usage: AssistantMessage["usage"]): numbe
 }
 
 // Normalize the gateway's finishReason onto pi's stop reasons. Some OSS
-// models report "stop" even when they emitted tool calls; pi must still
-// route those as tool use (mirrors the cliproxy commandcode translator).
+// models report "stop" even when they emitted tool calls, so tool calls in
+// the message override the reported reason.
 function resolveStopReason(reason: string | undefined, sawToolCall: boolean): "stop" | "length" | "toolUse" {
 	if (reason === "length") return "length";
 	if (reason === "tool-calls" || reason === "tool_calls" || reason === "tool_use") return "toolUse";
@@ -427,6 +497,7 @@ export function streamCommandCode(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
+	model = augmentFromCatalog(model);
 
 	(async () => {
 		const output = newAssistantMessage(model);
@@ -532,13 +603,23 @@ export function streamCommandCode(
 					}
 					case "error": {
 						const err = gatewayEvent.error;
-						const detail =
-							err && typeof err === "object"
-								? `${(err as GatewayEvent).type ?? "error"}: ${(err as GatewayEvent).message ?? stringifyUnknown(err)}`
-								: (gatewayEvent.message ??
-									(gatewayEvent.error === undefined
-										? "Command Code stream error"
-										: stringifyUnknown(gatewayEvent.error)));
+						let detail: string;
+						if (err && typeof err === "object") {
+							const e = err as Record<string, unknown>;
+							const type = typeof e.type === "string" ? e.type : "error";
+							const message = typeof e.message === "string" ? e.message : stringifyUnknown(err);
+							const statusCode = typeof e.statusCode === "number" ? e.statusCode : undefined;
+							const isRetryable = typeof e.isRetryable === "boolean" ? e.isRetryable : undefined;
+							detail = `${type}: ${message}`;
+							if (statusCode !== undefined) detail += ` (status ${statusCode})`;
+							if (isRetryable !== undefined) detail += ` [retryable=${isRetryable}]`;
+						} else {
+							detail =
+								gatewayEvent.message ??
+								(gatewayEvent.error === undefined
+									? "Command Code stream error"
+									: stringifyUnknown(gatewayEvent.error));
+						}
 						throw new Error(`Command Code stream error: ${detail}`);
 					}
 				}
