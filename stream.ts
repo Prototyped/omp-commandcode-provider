@@ -16,7 +16,7 @@ import type {
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
-import { BASE_URL, COMMAND_CODE_VERSION, ENDPOINT } from "./constants.ts";
+import { BASE_URL, COMMAND_CODE_VERSION, ENDPOINT, PROVIDER_ID } from "./constants.ts";
 import { convertMessages } from "./messages.ts";
 import { deriveSessionId, systemPromptText } from "./session.ts";
 
@@ -442,7 +442,7 @@ export function streamCommandCode(
 			const apiKey = options?.apiKey;
 			if (!apiKey)
 				throw new Error(
-					"No Command Code API key. Use /login commandcode, or set an apiKey for the commandcode provider in models.yml, or export COMMANDCODE_API_KEY.",
+					`No Command Code API key. Use /login ${PROVIDER_ID}, or set an apiKey for the ${PROVIDER_ID} provider in models.yml, or export COMMANDCODE_API_KEY.`,
 				);
 
 			stream.push({ type: "start", partial: output });

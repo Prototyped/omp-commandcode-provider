@@ -158,12 +158,15 @@ it returns 200 through the extension. This is working as intended and matches
 the README; the only gap is that the failure mode is a 422 the extension reports
 as a bare HTTP error.
 
-### 3.5 The "Go subscription does not permit API access" 403
+### 3.5 The "Go plan doesn't include API access" 403 — a provider-id collision
 
-Not reproducible on this account through `/alpha/generate` — every probe of
-`meta/muse-spark-1.3-contributor` (and every other model) returns 200 or a
-`MODEL_NOT_IN_PLAN` 403, never the API-access message. That exact wording is
-emitted **only** by the Pro-gated compat endpoints; measured live:
+This is the one failure that is neither the gateway's nor the user's fault.
+
+omp 18.14.0 **ships its own `commandcode` provider**: a bundled catalog row with
+`api: openai-completions` and `baseUrl: https://api.commandcode.ai/provider/v1`
+— the Go-gated compat surface. The extension registered the _same provider id_,
+pointing at `/alpha/generate`. The two coexisted, and turns were routed to the
+compat provider, which answers for every model:
 
 ```
 POST /provider/v1/chat/completions
@@ -172,28 +175,44 @@ Provider or higher at https://commandcode.ai/billing to use these endpoints.",
 "type":"permission_error","code":"upgrade_required"}}
 ```
 
-and `/provider/v1/messages` for that same model returns
-`Model "meta/muse-spark-1.3-contributor" is not supported on this endpoint.`
+Measured for `deepseek/deepseek-v4-flash`, `poolside/laguna-s-2.1-free`,
+`meta/muse-spark-1.3-contributor` and `ornith/ornith-1.5-122b` alike — i.e. not
+model-specific, which is why it looked like "the subscription lost API access".
+omp's log shows it recurring from 2026-10-30T23:24 through 2026-10-31T09:55, for
+every role in `config.yml` (`default`, `advisor`, `smol`, `slow`, `task`, …).
 
-Two candidate explanations, both consistent with the evidence `[INFERENCE]`:
+Evidence that the extension was never the caller: through its own `streamSimple`
+the same models return 200 (`meta/muse-spark-1.3-contributor`,
+`deepseek/deepseek-v4.1-flash`) or a model-specific error — never this message —
+and no commit in the repo has ever sent `/provider/v1/*`.
 
-1. The request went out over a `/provider/v1/*` path rather than
-   `/alpha/generate` — a second `models.yml` provider pointing at
-   `https://api.commandcode.ai/provider/v1`, or a compat-mode client. Worth
-   checking `models.yml` before anything else; the extension is not the only
-   thing that can address this gateway.
-2. It predates the current subscription row
-   (`currentPeriodStart: 2026-10-30T19:51:08Z`); a request made before that had
-   no plan, and no plan fails closed on some paths.
+Header fingerprinting was ruled out separately: dropping `User-Agent`,
+`x-session-id`, or `x-cli-environment` from an `/alpha/generate` request still
+returned 200 for every model tested.
 
-Either way, header fingerprinting is not implicated: dropping `User-Agent`,
-`x-session-id`, and `x-cli-environment` from the request each still returned 200
-for this model. If it recurs, capture the failing request's URL and headers
-before retrying.
+The bundle's row is proof of the collision:
+
+```
+[0, [107, "openai-completions", 108, "https://api.commandcode.ai/provider/v1",
+     113, 200000, 114, [1139], 119, [545], 117, [23], 121, 65536,
+     122, "MiniMax M2.7"], 17, [0]]
+```
+
+**Fix (implemented):** register as `commandcode-alpha`, after the `/alpha/*`
+surface the extension actually speaks, so the built-in compat provider keeps its
+own id and models resolve unambiguously. Cost of the rename is config churn:
+`/login commandcode-alpha`, `models.yml` → `providers.commandcode-alpha`, model
+references `commandcode-alpha/<id>`. Because the credential row is keyed by
+provider id, an existing `/login commandcode` key is not seen by the renamed
+provider, so users must re-run `/login commandcode-alpha` (or set
+`COMMANDCODE_API_KEY`) once.
+
+The same collision explains why `omp models` reported the extension's 65
+discovered models under `commandcode`: two registrations, one id.
 
 ### 3.6 Consequence for the extension
 
-The `smol` role is configured as `commandcode/inclusionai/ling-3.1-flash-1019:free`,
+The `smol` role is configured as `commandcode/inclusionai/ling-3.1-flash-1019:free` (old provider id; see §3.7),
 which now returns `429 RATE_LIMITED — You've used all 100 free Ling 3.1 Flash
 1019 requests for today`. The paid id `inclusionai/ling-3.1-flash` answers 200.
 The `task`/`tiny`/`commit` roles point at `poolside/laguna-s-2.1-free`, which is

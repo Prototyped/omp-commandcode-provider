@@ -24,7 +24,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { load as loadYaml } from "js-yaml";
-import { BASE_URL, MODELS_ENDPOINT } from "./constants.ts";
+import { BASE_URL, MODELS_ENDPOINT, PROVIDER_ID } from "./constants.ts";
 
 // ---- Models -------------------------------------------------------------
 // There is no static model list in this extension. At startup the roster is
@@ -79,7 +79,7 @@ export async function readExcludedModels(agentDir: string): Promise<Set<string>>
 	try {
 		const raw = await readFile(path.join(agentDir, "models.yml"), "utf8");
 		const data = (loadYaml(raw) ?? null) as ModelsYaml | null;
-		const list = data?.providers?.commandcode?.excludedModels;
+		const list = data?.providers?.[PROVIDER_ID]?.excludedModels;
 		if (!Array.isArray(list)) return new Set();
 		return new Set(list.filter((id): id is string => typeof id === "string" && id !== ""));
 	} catch {

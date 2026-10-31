@@ -43,11 +43,11 @@ The CLI also supports `--local` (`http://localhost:9090`) and `--staging`
 
 ### Other endpoints the extension touches
 
-| Path                         | Purpose                                                                                                                |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `GET /alpha/whoami`          | `/login commandcode` validates the pasted key here, mirroring the CLI; a 401 rejects the key, 403/unreachable keeps it |
-| `GET /provider/v1/models`    | live roster discovery at startup (public — answers unauthenticated); no static fallback in `index.ts` when unavailable |
-| `GET /alpha/billing/credits` | real credit balance (see `docs/caching.md`)                                                                            |
+| Path                         | Purpose                                                                                                                      |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `GET /alpha/whoami`          | `/login commandcode-alpha` validates the pasted key here, mirroring the CLI; a 401 rejects the key, 403/unreachable keeps it |
+| `GET /provider/v1/models`    | live roster discovery at startup (public — answers unauthenticated); no static fallback in `index.ts` when unavailable       |
+| `GET /alpha/billing/credits` | real credit balance (see `docs/caching.md`)                                                                                  |
 
 `GET /provider/v1/models?view=client` (the CLI's model catalog) and
 `GET /alpha/lifecycle-events` are **not** used. Neither is a staleness signal:

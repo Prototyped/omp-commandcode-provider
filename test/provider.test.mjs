@@ -15,7 +15,7 @@ const handlers = new Map();
 
 registerCommandCode({
 	registerProvider(name, config) {
-		assert.equal(name, "commandcode");
+		assert.equal(name, "commandcode-alpha");
 		provider = config;
 	},
 	on(event, handler) {
@@ -56,7 +56,7 @@ const model = {
 	id: "deepseek/deepseek-v4-flash",
 	name: "DeepSeek V4 Flash",
 	api: "commandcode-generate",
-	provider: "commandcode",
+	provider: "commandcode-alpha",
 	reasoning: true,
 	input: ["text"],
 	contextWindow: 1_000_000,
@@ -769,7 +769,7 @@ function discoveryFetch({
 
 test("fetchDynamicModels maps the live roster with models.dev capabilities and exclusions", async () => {
 	withAgentDir(`providers:
-  commandcode:
+  commandcode-alpha:
     apiKey: user_test
     excludedModels:
       - "deepseek/deepseek-v4-pro"
@@ -893,7 +893,7 @@ test("fetchDynamicModels still maps the roster when models.dev is unreachable", 
 
 test("exclusions filter the live roster", async () => {
 	withAgentDir(`providers:
-  commandcode:
+  commandcode-alpha:
     apiKey: user_test
     excludedModels:
       - "deepseek/deepseek-v4-pro"
@@ -1016,7 +1016,7 @@ test("readExcludedModels tolerates missing files and bad yaml", async () => {
 	assert.deepEqual(await readExcludedModels(agentDir), new Set());
 
 	withAgentDir(`providers:
-  commandcode:
+  commandcode-alpha:
     apiKey: user_test
     excludedModels:
       - "a/b"

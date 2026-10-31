@@ -17,17 +17,17 @@ This extension instead talks to `/alpha/generate`, the endpoint the Command Code
 Log in with your Command Code API key (mint one at [commandcode.ai/settings](https://commandcode.ai/settings), it looks like `user_…`):
 
 ```
-/login commandcode
+/login commandcode-alpha
 ```
 
 The key is validated against `GET /alpha/whoami` (the same check the `cmd` CLI makes) and stored in the harness credential store. A 401 rejects the key; a 403 or an unreachable endpoint keeps it, matching CLI behavior.
 
-Fallbacks, in order: an `apiKey` on the `commandcode` provider entry in your `models.yml`, then the `COMMANDCODE_API_KEY` environment variable:
+Fallbacks, in order: an `apiKey` on the `commandcode-alpha` provider entry in your `models.yml`, then the `COMMANDCODE_API_KEY` environment variable:
 
 ```yaml
 # models.yml
 providers:
-  commandcode:
+  commandcode-alpha:
     apiKey: user_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
@@ -54,11 +54,11 @@ Or try it for one run without installing — clone the repo, `bun install`, then
 ## Use
 
 ```bash
-omp --model "commandcode/deepseek/deepseek-v4-pro" -p "what is 17 * 23?"
-omp --model "commandcode/moonshotai/Kimi-K2.6" -p "draft a haiku about caching"
+omp --model "commandcode-alpha/deepseek/deepseek-v4-pro" -p "what is 17 * 23?"
+omp --model "commandcode-alpha/moonshotai/Kimi-K2.6" -p "draft a haiku about caching"
 ```
 
-`omp models commandcode` shows everything registered.
+`omp models commandcode-alpha` shows everything registered.
 
 ## Models
 
@@ -69,11 +69,11 @@ There is no model list in this extension. At startup the roster is discovered li
 
   ```yaml
   providers:
-    commandcode:
+    commandcode-alpha:
       excludedModels:
         - "Qwen/Qwen3.7-Max"
   ```
-- **If discovery fails** (endpoint down, or its response shape changed), the provider registers with no models — there is deliberately no static fallback to serve stale. `omp models commandcode` shows nothing until the next startup succeeds, or until `omp models refresh`.
+- **If discovery fails** (endpoint down, or its response shape changed), the provider registers with no models — there is deliberately no static fallback to serve stale. `omp models commandcode-alpha` shows nothing until the next startup succeeds, or until `omp models refresh`.
 
 **Proprietary models (omitted by default).** The gateway also lists proprietary frontier models (ids with the `claude-`, `gpt-`, and `google/gemini-` prefixes). They bill real plan credits and are usually cheaper elsewhere, so discovery filters them out (see `PROPRIETARY_PREFIXES` in `index.ts`).
 
@@ -105,7 +105,7 @@ Reverse-engineered reference for the undocumented endpoint this extension speaks
 - **Undocumented endpoint.** `/alpha/generate` isn't a published API surface. Command Code can change the schema at any time. If they tighten the request shape, expect 400 errors until the extension is updated. For request-schema 400s, first compare the outgoing body in `index.ts` against the current CLI envelope: `config.{workingDir, date, environment, structure, isGitRepo, currentBranch, mainBranch, gitStatus, recentCommits}`, `memory: string`, `taste`, `skills`, `permissionMode`, and `params.{model, system, messages, tools, max_tokens, stream}`.
 - **Tier policy.** This extension uses an endpoint the official CLI uses, on credentials your plan grants. Command Code may consider that fair game or may not; their published "API access" feature still requires the Pro plan. If your account gets flagged or rate-limited, that's the realistic downside.
 - **Vision depends on the model.** Image input is taken from models.dev's `attachment` flag per model; a model it doesn't list is assumed text-only.
-- **Cost comes from the gateway, not token rates.** Per-model rates are set to $0 (the Go plan's per-model multipliers don't map to per-token pricing); the session meter instead shows the gateway's reported upstream USD cost from `providerMetadata.gateway.cost`. If a response omits it, that call meters $0. Real balance: `curl -H "Authorization: Bearer $COMMANDCODE_API_KEY" https://api.commandcode.ai/alpha/billing/credits`.
+- **The session meter currently reads $0 per call.** Per-model rates are set to $0 and the gateway reports no per-request cost on `/alpha/generate` — `providerMetadata.gateway.cost` never appears, contrary to what earlier revisions of this README claimed. Real balance: `curl -H "Authorization: Bearer $COMMANDCODE_API_KEY" https://api.commandcode.ai/alpha/billing/credits`. `docs/protocol-upgrade-plan.md` replaces this with local rate math over the gateway catalog's `pricing`.
 - **Reasoning is heavy.** DeepSeek V4 Pro and Qwen 3.7 Max emit a lot of reasoning tokens by default. A short answer can cost 10–30× the input. Budget accordingly on the Go plan.
 
 ## Development
@@ -115,7 +115,7 @@ git clone https://github.com/Prototyped/omp-commandcode-provider
 cd omp-commandcode-provider
 
 # Test it without installing
-omp -e . -p "say pong"     # with an interactive session: /login commandcode when it asks for a key
+omp -e . -p "say pong"     # with an interactive session: /login commandcode-alpha when it asks for a key
 # (COMMANDCODE_API_KEY still works as a fallback)
 
 # Install deps, type-check, lint+format, test (all via bun)

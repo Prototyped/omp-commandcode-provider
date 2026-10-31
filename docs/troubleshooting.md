@@ -14,11 +14,11 @@ paths use an OpenAI-style `{"error":{"message","type","code"}}`.
 }
 ```
 
-The key didn't resolve. Resolution order is: `/login commandcode` credential →
+The key didn't resolve. Resolution order is: `/login commandcode-alpha` credential →
 `models.yml` `providers.commandcode.apiKey` → the `COMMANDCODE_API_KEY` env var.
 Causes, in order of likelihood:
 
-- You never logged in, and no fallback key is set. Run `/login commandcode`
+- You never logged in, and no fallback key is set. Run `/login commandcode-alpha`
   and paste a `user_…` key from [commandcode.ai/settings](https://commandcode.ai/settings).
 - The key is wrong / rotated. Verify it directly:
 
@@ -28,7 +28,7 @@ Causes, in order of likelihood:
   # → 200 {"success":true,"user":{…}}  means the key is good
   ```
 - You logged in, then rotated the key out from under the session. Re-run
-  `/login commandcode` — the next request picks up the new credential.
+  `/login commandcode-alpha` — the next request picks up the new credential.
 
 ## 403 — `upgrade_required`
 
@@ -48,7 +48,7 @@ You hit `/provider/v1/messages` or `/provider/v1/chat/completions`, which are
 Pro-gated. This extension does **not** use those — it uses `/alpha/generate`.
 If you see this, something is calling the compat endpoints directly (e.g. a
 `models.json` provider entry pointing at `https://api.commandcode.ai/provider/v1`).
-Remove that entry; let the extension own the `commandcode` provider.
+Remove that entry; let the extension own the `commandcode-alpha` provider.
 
 ### Cause 2 — the CLI version is below the gateway's floor
 
@@ -177,7 +177,7 @@ ever see it again, run with `DEBUG=1` — the extension logs the raw error objec
 to stderr:
 
 ```bash
-DEBUG=1 omp --model "commandcode/deepseek/deepseek-v4-pro" -p "test" 2>&1 \
+DEBUG=1 omp --model "commandcode-alpha/deepseek/deepseek-v4-pro" -p "test" 2>&1 \
   | grep '\[commandcode\]'
 ```
 

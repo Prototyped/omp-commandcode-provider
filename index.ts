@@ -19,7 +19,7 @@
  */
 import type { OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { BASE_URL, COMMAND_CODE_VERSION } from "./constants.ts";
+import { BASE_URL, COMMAND_CODE_VERSION, PROVIDER_ID } from "./constants.ts";
 import { discoverModels } from "./discovery.ts";
 import { streamCommandCode } from "./stream.ts";
 import { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText } from "./update.ts";
@@ -52,7 +52,7 @@ async function login(callbacks: OAuthLoginCallbacks): Promise<string> {
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerProvider("commandcode", {
+	pi.registerProvider(PROVIDER_ID, {
 		baseUrl: BASE_URL,
 		// With `oauth` present this is a last-resort fallback: a /login-saved
 		// key (or a models.yml apiKey) wins over the env var.
