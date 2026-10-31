@@ -17,7 +17,7 @@ An extension for the [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) cod
   - `exclusions.ts` — `models.yml` `excludedModels`.
   - `stream.ts` — the `/alpha/generate` request envelope, NDJSON reader, block-stream handlers (`BlockStreams`), and the event dispatcher.
   - `update.ts` — `COMMAND_CODE_VERSION` staleness check (npm newest-stable, the CLI's own updater source) and the status-line text.
-- `docs/wire-protocol.md` — the authoritative field-by-field contract for the endpoint. **Keep it in lockstep with `stream.ts`/`messages.ts`**; when one changes, so does the other.
+- `docs/wire-protocol.md` — the authoritative field-by-field contract for the endpoint. **Keep it in lockstep with `stream.ts`/`messages.ts`**; when one changes, so does the other. It documents the **wire** only: what the pinned CLI puts on the wire (requests, responses, NDJSON events, the catalog document shape) and how the gateway answers. CLI-local behavior (catalog caching, picker/runner decisions, npm update checks) and the extension's implementation are out of scope. The extension appears only as marked `Divergence (extension):` notes where it sends a different payload than the CLI — never as description of its own code.
 - `docs/caching.md`, `docs/troubleshooting.md` — measured caching behavior and the error-mode guide.
 - The upstream schema is undocumented and changes without notice. `COMMAND_CODE_VERSION` in `constants.ts` pins the CLI release whose wire protocol this implementation matches (currently `1.88.2`) — it is not a dependency version, it is a protocol-version marker.
 
@@ -98,3 +98,5 @@ Everything below is a `rg` search in `"$F"` (minified single file; use wide `-{8
 
 - Search with `rg`. No comments except where the code's form doesn't explain a non-obvious behavior (wire-protocol quirks, divergences from the CLI, gateway validation rules).
 - Comments that quote the CLI or a live observation should say _where_ the fact came from (bundle function name, endpoint, date).
+- Documentation, docstrings, and comments describe the repository's **current** state — never the shape it had before, what a change replaced, or what was checked and found absent. No "used to", "previously", "old symptom (fixed)", check-logs ("X was verified not to exist"), or references to symbols, fields, and files that no longer exist. If a sentence is only meaningful as a history of the code, delete it.
+- Don't comment on what the code is _not_ doing when that not-doing was its previous behavior; state what it does. Drop comments with no bearing on the current code, however true they once were.
