@@ -627,6 +627,22 @@ test("request body is the full /alpha/generate envelope", async () => {
 	);
 	assert.equal(body.params.temperature, 0.2);
 	assert.equal(body.params.max_tokens, 1234);
+
+	// pi-ai hands the system prompt as parts (string[]); the gateway's
+	// params.system schema rejects an array (400 "expected string, received
+	// array", observed 2026-10-31) — the parts must go out joined.
+	mockFetch(async (_url, init) => {
+		body = JSON.parse(init.body);
+		return ndjsonResponse(['{"type":"finish","finishReason":"stop"}']);
+	});
+	await collect(
+		provider.streamSimple(
+			model,
+			{ ...context, systemPrompt: ["part one", "part two"] },
+			{ apiKey: "user_test", sessionId },
+		),
+	);
+	assert.equal(body.params.system, "part one\n\npart two");
 });
 
 test("x-session-id is a stable RFC 4122 UUID per conversation", async () => {
@@ -663,6 +679,26 @@ test("x-session-id is a stable RFC 4122 UUID per conversation", async () => {
 	// ...a non-UUID one is ignored in favor of the derived id.
 	await collect(provider.streamSimple(model, context, { apiKey: "user_test", sessionId: "not-a-uuid" }));
 	assert.equal(seen[4].sessionId, seen[0].sessionId);
+
+	// Array prompt parts canonicalize the same way as the request body's
+	// joined string, so both forms of the same prompt keep one identity.
+	await collect(
+		provider.streamSimple(
+			model,
+			{ ...context, systemPrompt: ["first line", "second line"] },
+			{ apiKey: "user_test" },
+		),
+	);
+	await collect(
+		provider.streamSimple(
+			model,
+			{ ...context, systemPrompt: "first line\n\nsecond line" },
+			{ apiKey: "user_test" },
+		),
+	);
+	assert.match(seen[5].sessionId, uuid);
+	assert.equal(seen[6].sessionId, seen[5].sessionId);
+	assert.notEqual(seen[5].sessionId, seen[0].sessionId);
 
 	// The body's threadId mirrors the header on every call.
 	for (const call of seen) assert.equal(call.threadId, call.sessionId);

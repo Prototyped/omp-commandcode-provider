@@ -93,7 +93,7 @@ Body:
 	"permissionMode": "standard",
 	"params": {
 		"model": "deepseek/deepseek-v4-pro", // canonical id from /provider/v1/models
-		"system": "…system prompt…",
+		"system": "…system prompt…", // plain string — see note under the envelope
 		"messages": [
 			/* Vercel AI SDK ModelMessage[] — see below */
 		],
@@ -123,6 +123,22 @@ into the system-prompt preamble. Neutral defaults (empty strings / arrays /
 `isGitRepo:false`) work fine. A fork that wants real project context (for
 Command Code's "taste" subsystem) populates them for real; see `staticConfig()`
 in `index.ts`.
+
+### `params.system` must be a string
+
+The schema for `params.system` is a union of a plain string and an array of
+objects; an array of strings is rejected by both branches (observed 400,
+2026-10-31):
+
+```
+Validation error: Invalid input: expected string, received array at "params.system"
+or Invalid input: expected object, received string at "params.system[0]"
+```
+
+The harness (pi-ai) hands the system prompt as parts — `Context.systemPrompt`
+is `string[]` — so `systemPromptText()` in `session.ts` joins them with
+`\n\n` before sending. The session-id seed uses the same canonicalization so
+both prompt forms keep one identity.
 
 ### Messages use the Vercel AI SDK `ModelMessage` schema
 

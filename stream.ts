@@ -18,7 +18,7 @@ import type {
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { BASE_URL, COMMAND_CODE_VERSION, ENDPOINT } from "./constants.ts";
 import { convertMessages } from "./messages.ts";
-import { deriveSessionId } from "./session.ts";
+import { deriveSessionId, systemPromptText } from "./session.ts";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -180,7 +180,7 @@ function requestBody(
 		permissionMode: "standard",
 		params: {
 			model: model.id,
-			system: context.systemPrompt ?? "",
+			system: systemPromptText(context.systemPrompt),
 			messages: convertMessages(context.messages),
 			tools,
 			max_tokens: options?.maxTokens ?? model.maxTokens ?? 8192,

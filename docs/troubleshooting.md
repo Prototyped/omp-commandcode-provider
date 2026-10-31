@@ -79,6 +79,19 @@ tool results folded in) instead of `tool-call` / `tool-result` /
 migrates to a new message schema version, `convertMessages()` is where to fix
 it.
 
+### `params.system` sent as an array
+
+```
+Validation error: Invalid input: expected string, received array at "params.system"
+or Invalid input: expected object, received string at "params.system[0]"
+```
+
+The gateway's `params.system` schema is a string-or-object-array union; an
+array of strings fails both branches. The harness passes the system prompt as
+parts (`Context.systemPrompt` is `string[]` in pi-ai), so they must be joined
+before sending — see `systemPromptText()` in `session.ts` and
+`docs/wire-protocol.md`.
+
 ### Model not supported on this endpoint
 
 ```json

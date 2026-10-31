@@ -14,6 +14,19 @@
  */
 import type { Context } from "@oh-my-pi/pi-ai";
 
+/**
+ * The harness hands the system prompt as parts (pi-ai `Context.systemPrompt`
+ * is `string[]`). The gateway's `params.system` schema rejects an array of
+ * strings (observed 400 "expected string, received array at params.system",
+ * 2026-10-31 — the union's other branch is an array of objects), so the
+ * parts canonicalize to one "\n\n"-joined string. Shared by the request
+ * body (stream.ts) and the session seed below so both agree.
+ */
+export function systemPromptText(systemPrompt: string | string[] | undefined): string {
+	const parts = typeof systemPrompt === "string" ? [systemPrompt] : (systemPrompt ?? []);
+	return parts.join("\n\n");
+}
+
 const FNV_OFFSET = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
 
@@ -50,7 +63,7 @@ export function deriveSessionId(context: Context): string {
 				.join("");
 		if (firstUser.length > 0) break;
 	}
-	const seed = `${process.cwd()}\u0000${context.systemPrompt ?? ""}\u0000${firstUser}`;
+	const seed = `${process.cwd()}\u0000${systemPromptText(context.systemPrompt)}\u0000${firstUser}`;
 	const hex = sessionDigest(seed);
 	// The gateway validates threadId as a strict RFC 4122 UUID (the CLI sends
 	// crypto.randomUUID() session ids), so pin the version (4) and variant (8)
