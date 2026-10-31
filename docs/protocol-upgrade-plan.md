@@ -1,279 +1,381 @@
 # Protocol upgrade plan — 0.52.1 → 1.88.2
 
-Status: proposal, not yet implemented. Every statement below was verified on 2026-10-31 against the
-live gateway with a real key, or read out of one of the two CLI bundles
-(`command-code@0.52.1` — the current pin — and `command-code@1.88.2`, the
-current npm `latest`). Claims that are inference are marked `[INFERENCE]`.
-`docs/wire-protocol.md` is **not** treated as evidence anywhere in this
-document; §1 audits it.
+Status: proposal, not yet implemented. Everything below was verified on
+2026-10-31 against the live gateway with a real key, or read out of one of the
+two CLI bundles (`command-code@0.52.1` — the current pin — and
+`command-code@1.88.2`, the current npm `latest`). Inference is marked
+`[INFERENCE]`. `docs/wire-protocol.md` is **not** treated as evidence anywhere
+here; §1 audits it.
 
 ## Verdict
 
 The **request/response wire contract did not break.** An unmodified 0.52.1-shaped
-body still returns 200 and the same NDJSON event sequence from the live gateway.
-The 400/401/403 error surface is unchanged.
+body still returns 200 and the same NDJSON event sequence. What changed is
+everything around the body:
 
-Four things did change, and three of them are the extension's responsibility:
-
-1. **Cost reporting regressed.** `providerMetadata.gateway.cost` — the field
-   `stream.ts` meters from — is **gone**. No probe of any model returned it.
-   The extension therefore meters `$0.00` for every call today (measured).
-   The gateway now reports usage only; cost must be derived client-side from
-   the catalog's `pricing` rates, which is what 1.88.2 does
-   (`estimateCatalogCostUsd`).
-2. **Capability sourcing moved to the gateway.** 1.88.2 replaces its hardcoded
-   model registry (`Kt`) with `GET /provider/v1/models?view=client`, a versioned
-   catalog carrying `context_length`, `maxOutputTokens`, `inputModalities`,
+1. **Cost must be computed client-side.** `providerMetadata.gateway.cost` /
+   `.inferenceCost` were never observed on any stream (5 consecutive calls,
+   4 models, ZDR on and off). The extension meters `$0.00` per call today
+   (measured). Those fields appear to have been inferred from the Vercel AI SDK
+   rather than observed on this gateway; treat them as non-existent and do not
+   keep an override path for them. 1.88.2 computes USD from the catalog's
+   `pricing` rates (`estimateCatalogCostUsd`), and that is the only sound source.
+2. **Capabilities come from the gateway catalog.** 1.88.2 replaced its hardcoded
+   registry (`Kt`) with `GET /provider/v1/models?view=client`: a versioned
+   document carrying `context_length`, `maxOutputTokens`, `inputModalities`,
    `reasoningEfforts`, `pricing`, `hidden`, `category`, `minimumPlan`, `zdr`,
-   `aliases`, `roles`, and a per-model `behaviorProfile`. The extension still
-   guesses all of this from models.dev.
-3. **Per-model protocol quirks became data.** Six `behaviorProfile` values now
-   drive deferred tools, interleaved thinking, thinking-prefix binding, and
-   forced tool choice. The extension sends none of the corresponding request
-   fields (`reasoning_effort`, `promptCache`, `mode`) and has no equivalent of
-   the vision-stripping preprocessing.
-4. **The CLI version floor moved.** The pinned `0.52.1` is still above the
-   gateway floor (`minVersion: 0.18.10`), so nothing is broken _now_ — but the
-   pin no longer describes what the gateway is actually doing.
+   `aliases`, `roles`, and a per-model `behaviorProfile`.
+3. **Per-model quirks became data.** Six `behaviorProfile` values drive deferred
+   tools, interleaved thinking, thinking-prefix binding, and forced tool choice.
+4. **Several models fail through this extension's shape but not the CLI's** —
+   see §3. Three distinct causes, all fixable, none of them a broken protocol.
+
+The CLI version floor (`minVersion: 0.18.10`) still admits the pin, so nothing
+is broken _now_; the pin simply no longer describes what the gateway is doing.
 
 ## 1. `docs/wire-protocol.md` audit
 
-Verified claim by claim. "True" = reproduced live on 2026-10-31.
+"True" = reproduced live on 2026-10-31.
 
-| Claim in the doc                                                                                                                                    | Verdict               | Evidence                                                                                                                                               |
-| --------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Response is newline-delimited JSON, not SSE                                                                                                         | **True**              | One JSON object per `\n`, no `data:`/`event:` prefixes                                                                                                 |
-| Event vocabulary `start`, `start-step`, `reasoning-*`, `text-*`, `tool-input-*`, `tool-call`, `finish-step`, `finish`, `provider-metadata`, `error` | **True**              | All observed in one tool-calling turn                                                                                                                  |
-| Tool deltas key on `id`, final `tool-call` keys on `toolCallId`                                                                                     | **True**              | `{"type":"tool-input-start","id":"call_00_…"}` … `{"type":"tool-call","toolCallId":"call_00_…"}`                                                       |
-| `params.system` must be a string; `string[]` is rejected                                                                                            | **True**              | `["a","b"]` → 400 `expected object, received string at "params.system[0]"`. `"a"` and `[{type:"text",text:"a"}]` and blocks with `cache_control` → 200 |
-| Every `config.*` field is required                                                                                                                  | **True**              | Deleting any one of the nine → 400 naming that path                                                                                                    |
-| `memory` is a required string                                                                                                                       | **True**              | Missing → 400; `""` → 200; `null` also accepted; `{}` → 400                                                                                            |
-| `taste`, `skills`, `permissionMode`, `threadId`, `mode` are required                                                                                | **False**             | Each omits cleanly → 200. (`skills`/`memory` reject non-strings; `taste` accepts a string)                                                             |
-| `threadId` must be a strict RFC 4122 UUID                                                                                                           | **True**              | `"not-a-uuid"` → 400 `Invalid UUID at "threadId"`; omission → 200                                                                                      |
-| Messages are Vercel `ModelMessage[]`; Anthropic shape returns 400                                                                                   | **False**             | A user message containing an Anthropic `tool_result` block → 200. Roles are restricted to `user`/`assistant`(+`tool`): `role:"system"` → 400           |
-| Tool result `output` must be `{type:"text"                                                                                                          | "error-text", value}` | **Overstated**                                                                                                                                         | An arbitrary `output` type (`{type:"nope"}`) → 200; a bare string → 200 |
-| `tool-result` requires `toolName`                                                                                                                   | **True**              | Missing → 400 (the error message misreports it as a role/content failure)                                                                              |
-| Images ride as their own `role:"user"` message; no images in tool-result output                                                                     | **False**             | `output:{type:"content",value:[{type:"media",data,mediaType}]}` → 200. 1.88.2's own `toolResultOutput` emits exactly that shape                        |
-| Tools are `{name,description,input_schema}` (snake_case)                                                                                            | **True**              | `parameters`/`inputSchema` → 400                                                                                                                       |
-| Cost is read from `providerMetadata.gateway.cost` / `.inferenceCost`                                                                                | **False**             | Absent from every probe (5 consecutive calls, 4 models, ZDR on/off). `providerMetadata` only carried `{novita:{...}}` or `{deepseek:{...}}`            |
-| `finish-step.usage` and `finish.totalUsage`                                                                                                         | **True**              | Both present; `finish` carries the same numbers                                                                                                        |
-| `usage.cachedInputTokens`, `.inputTokenDetails.cacheReadTokens`, `.raw.prompt_cache_hit_tokens`                                                     | **True**              | All three present and equal on a warm prefix (1536)                                                                                                    |
-| `finishReason` values `stop`/`length`/`tool-calls`                                                                                                  | **True**, incomplete  | Also `refusal` in 1.88.2's own mapper (`consumedStopReason`)                                                                                           |
+| Claim in the doc                                                                                                                                    | Verdict              | Evidence                                                                                                                                             |
+| --------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Response is newline-delimited JSON, not SSE                                                                                                         | **True**             | One JSON object per `\n`, no `data:`/`event:` prefixes                                                                                               |
+| Event vocabulary `start`, `start-step`, `reasoning-*`, `text-*`, `tool-input-*`, `tool-call`, `finish-step`, `finish`, `provider-metadata`, `error` | **True**             | All observed in one tool-calling turn                                                                                                                |
+| Tool deltas key on `id`, final `tool-call` keys on `toolCallId`                                                                                     | **True**             | `{"type":"tool-input-start","id":"call_00_…"}` … `{"type":"tool-call","toolCallId":"call_00_…"}`                                                     |
+| `params.system` must be a string; `string[]` is rejected                                                                                            | **True**             | `["a","b"]` → 400 `expected object, received string at "params.system[0]"`. `"a"`, `[{type:"text",text:"a"}]`, and blocks with `cache_control` → 200 |
+| Every `config.*` field is required                                                                                                                  | **True**             | Deleting any one of the nine → 400 naming that path                                                                                                  |
+| `memory` is a required string                                                                                                                       | **True**             | Missing → 400; `""` → 200; `null` → 200; `{}` → 400                                                                                                  |
+| `taste`, `skills`, `permissionMode`, `threadId`, `mode` are required                                                                                | **False**            | Each omits cleanly → 200                                                                                                                             |
+| `threadId` must be a strict RFC 4122 UUID                                                                                                           | **True**             | `"not-a-uuid"` → 400 `Invalid UUID at "threadId"`; omission → 200                                                                                    |
+| Messages are Vercel `ModelMessage[]`; Anthropic shape returns 400                                                                                   | **False**            | A user message containing an Anthropic `tool_result` block → 200. Roles are limited to `user`/`assistant`(+`tool`): `role:"system"` → 400            |
+| Tool-result `output` must be `{type:"text"\|"error-text", value}`                                                                                   | **Overstated**       | An arbitrary `output.type` (`{type:"nope"}`) → 200; a bare string → 200                                                                              |
+| `tool-result` requires `toolName`                                                                                                                   | **True**             | Missing → 400 (the error text misreports it as a role/content failure)                                                                               |
+| Images ride as their own `role:"user"` message; no images in tool-result output                                                                     | **False**            | `output:{type:"content",value:[{type:"media",data,mediaType}]}` → 200; 1.88.2's `toolResultOutput` emits exactly that                                |
+| Tools are `{name,description,input_schema}` (snake_case)                                                                                            | **True**             | `parameters`/`inputSchema` → 400                                                                                                                     |
+| Cost is in `providerMetadata.gateway.cost` / `.inferenceCost`                                                                                       | **False — remove**   | Never observed in any stream; `providerMetadata` only ever carried `{novita:{…}}` or `{deepseek:{…}}`                                                |
+| `finish-step.usage` and `finish.totalUsage`                                                                                                         | **True**             | Both present, same numbers                                                                                                                           |
+| `usage.cachedInputTokens`, `.inputTokenDetails.cacheReadTokens`, `.raw.prompt_cache_hit_tokens`                                                     | **True**             | All three present and equal on a warm prefix                                                                                                         |
+| `finishReason` ∈ `stop`/`length`/`tool-calls`                                                                                                       | **True, incomplete** | 1.88.2's own mapper also produces `refusal`                                                                                                          |
 
-Net: the structural claims hold. The two that mislead are the **cost field** and
-**"everything is required"**; both are corrected by this plan.
-
-## 2. Live-verified protocol facts (the basis for the work below)
+## 2. Live-verified protocol facts
 
 - **Model id rewriting.** Requesting `deepseek/deepseek-v4-flash` returns
-  `response.modelId: "deepseek/deepseek-v4.1-flash"`. Requests must not assume
-  `model.id` is what served the turn.
-- **Reasoning effort is advisory and unvalidated.** The gateway accepts any
-  string. On a model whose catalog `reasoningEfforts` is
-  `["off","low","high","max"]`, efforts `medium`/`xhigh`/`minimal`/`bogus` all
-  yield **0 reasoning tokens**, while `low`/`high`/`max` produce 70/90/103.
-  Omitting the field yields 0 for that model. Only the CLI's client-side guard
-  (`supportsThinking && isThinkingEffort`) keeps it inside the supported set.
-- **Vision is gated by the model, silently.** A red 64×64 PNG with
-  `deepseek/deepseek-v4.1-flash` → _"This image is red."_; the same image with
-  text-only `deepseek/deepseek-v4-flash` → _"no image was provided"_. No error.
-  1.88.2 therefore strips images client-side for non-vision models
-  (`stripImages` + `hasImage2`), replacing the last user message's images with
-  `<attached_image index="N">…` text and earlier ones with
-  `[image omitted: the active model is text-only]`.
-- **Prompt caching is content-addressed, not thread-addressed.** A fresh
-  `threadId` with a previously-seen prefix still reported
-  `cacheReadTokens: 1536` on its first call; a mismatched body/header
-  `threadId` did not disturb the hit. The README's claim that `threadId` holds
-  cache affinity is wrong; caching depends on prefix bytes (and is worth
-  measuring again after any change to `staticConfig()` or the system prompt).
-- **`x-command-code-version` does not change behaviour above the floor.** The
-  same request under `0.18.10`, `0.52.1`, and `1.88.2` produced byte-identical
-  event type sequences. Below the floor: 403 `upgrade_required` with
-  `error.minVersion` (`0.18.10` as of today).
-- **Two distinct failure channels.** Pre-flight problems are HTTP errors with
-  a JSON body: an unknown model id and a plan-gated model both return 403
-  (`Model/provider not recognized: …`, `MODEL_NOT_IN_PLAN: …`). A model that is
-  recognised but currently down returns **200** and streams
-  `{"type":"start"}` then
-  `{"type":"error","error":{"type":"server_error","message":"This model is
-  temporarily unavailable.","statusCode":400,"isRetryable":false}}` with no
-  `finish`. A client that only reports "stream ended before a terminal event"
-  describes the wrong cause.
-- **`pause_turn`.** 1.88.2 loops up to 5 times (`vS=5`) re-POSTing the identical
-  body when `rawFinishReason === "pause_turn"`, appending content. The event is
-  not reachable from the streams observed here; treat as tolerance, not a
-  feature to build `[INFERENCE]`.
-- **Catalog ≠ roster.** `GET /provider/v1/models` (plain) returns 95 rows with
-  only `id/name/context_length/supported_endpoints`; `?view=client` returns the
-  107-row catalog with capabilities and pricing. Every roster id is in the
-  catalog; the 12 extras are `:free`/stealth/hidden models. Twelve catalog rows
-  carry `hidden: true` and none of those appear in the plain roster.
+  `response.modelId: "deepseek/deepseek-v4.1-flash"`. Never assume the requested
+  id is the served one.
+- **Prompt caching is content-addressed, not thread-addressed.** A _fresh_
+  `threadId` with a previously-seen prefix still reported 1024–1536
+  `cacheReadTokens` on its first call; a mismatched body/header `threadId` did
+  not disturb the hit. The README's affinity claim is wrong.
+- **`x-command-code-version` changes nothing above the floor.** `0.18.10`,
+  `0.52.1` and `1.88.2` produced byte-identical event sequences. Below the floor
+  (`0.18.10` today): 403 `upgrade_required` with `error.minVersion`.
+- **`params.system` accepts a plain string _or_ text blocks** — but not the
+  harness's `string[]`, which is why `session.ts` joins first. Text blocks
+  additionally accept `cache_control: {type:"ephemeral"}`.
+- **Reasoning effort is unvalidated and silently degrades.** On a model whose
+  catalog `reasoningEfforts` is `["off","low","high","max"]`, the values
+  `medium`/`xhigh`/`minimal`/`bogus` all produced **0** reasoning tokens, while
+  `low`/`high`/`max` produced 70/90/103.
+- **Two failure channels.** Pre-flight failures are HTTP errors with a JSON
+  body (403 `MODEL_NOT_IN_PLAN`, 403 `Model/provider not recognized`, 429
+  `RATE_LIMITED`, 422 `CMD_ZDR_NO_PROVIDERS`). A recognised-but-down model
+  returns **200** and streams `{"type":"error",…}` with no `finish`.
 
-## 3. Plan
+## 3. Why some models fail here but work in the CLI
 
-Ordered by user-visible value per unit of risk. Each phase is independently
-shippable and testable; nothing depends on a phase landing after it except
-where stated.
+Sampled all 69 `opensource`-category roster models plus the `:free` entries
+through the extension's own `streamSimple` and a hand-built body. Result: 20 OK,
+14 plan-gated, 1 quota-limited, 4 stream errors. Four independent causes:
 
-### Phase 1 — Cost: stop metering zero (highest value, self-contained)
+### 3.1 Plan gating is enforced client-side by the CLI (14 models)
 
-Today `applyUsage` is right (verified against live numbers: `input` excludes
-cache reads, `cacheRead` matches `inputTokenDetails.cacheReadTokens`) but
-`updateGatewayCost` can never fire, so `usage.cost.total` is always 0.
+The gateway returns 403 `MODEL_NOT_IN_PLAN` for models above the account's plan.
+1.88.2 never sends those requests: it fetches `/alpha/billing/subscriptions`
+(`planId`, e.g. `individual-go-v1`) and `/alpha/billing/credits`
+(`purchasedCredits`, `freeCredits`), then filters the picker with
+`evaluateModelAccess`:
 
-1. Add `pricing` to discovery output and set the model's `cost` rates from it
-   (`inputCost`, `outputCost`, `cacheReadCost`, `cacheWriteCost`,
-   `cacheWrite1hCost` — USD per 1M tokens, matching pi's rate convention).
-2. Keep `providerMetadata.gateway.cost` as a _first-class override_ when
-   present (some routing may restore it) and fall back to local rate math
-   otherwise: `uncached*input + output*output + cacheRead*cacheRead +
-   cacheWrite5m*cacheWrite + cacheWrite1h*cacheWrite1h`, with
-   `uncached = max(0, input - cacheRead - cacheWrite)`.
+```
+if (purchasedCredits > 0 || freeCredits > 0) return allowed;
+if (!planId) return allowed;
+const n = Qr[planId];                       // { allowedCategories }
+const o = getCatalogModelAccess(model);     // { minimumPlan, category }
+if (!o?.category) return allowed;
+if (o.minimumPlan === undefined) return categoryAccess(n, o.category);
+return rankedAccess(planId, o.minimumPlan) ?? embeddedAccess(…) ?? categoryAccess(…);
+```
+
+with the rank order `["individual-go","individual-go-v1","individual-goat",
+"individual-pro","individual-pro-v1","individual-provider","individual-max",
+"individual-ultra","teams-pro"]` and category access `individual-go*` →
+`opensource` only; `individual-pro`/`-provider`/`-max`/`-ultra`/`teams-pro` →
+`opensource` + `premium`.
+
+The extension performs no such filter, so it registers and offers models that
+can only fail. Replaying that rule offline against the live catalog reproduces
+**every** observed 403 exactly (e.g. `meta/muse-spark-1.3` → `individual-goat`,
+`claude-opus-5` → `individual-provider`, `gpt-5.6-sol` → `individual-goat`).
+
+Note the trap: `category` is not a plan signal. `claude-sonnet-5-5`,
+`gpt-5.6-sol` and `meta/muse-spark-1.3` are all `category: "opensource"` yet need
+`individual-goat`; the existing `PROPRIETARY_PREFIXES` filter happens to catch
+the first two and misses the third.
+
+### 3.2 Retired and dead ids (roster/catalog disagree with upstream)
+
+- `poolside/laguna-s-2.1-free` → `Model 'poolside/laguna-s-2.1-free' not found.
+  If you were using its free tier, that has ended.` It is **still present in the
+  plain roster** (`GET /provider/v1/models`), so trusting that endpoint alone
+  yields a dead model.
+- `Qwen/Qwen3.6-Max-Preview` → `Model 'alibaba/qwen-3.6-max-preview' not found`
+  (the gateway rewrites to an id no upstream serves).
+- `inclusionai/ling-3.1-flash:free` → `The free Ling 3.1 Flash tier has been
+  retired`. It is `hidden: true` in the catalog and absent from the plain
+  roster — a hidden row that still resolves.
+- `thinkingmachines/inkling*`, `zai-org/GLM-5.1`, `MiniMaxAI/MiniMax-M2.7` →
+  `This model is temporarily unavailable` (transient; nothing to fix).
+
+These are gateway-side reality. The extension cannot prevent them, but it can
+report them as a model-level failure instead of a generic stream error, and it
+can stop hiding `hidden` rows from its own filter logic (`hidden` means "not in
+the picker", not "does not exist").
+
+### 3.3 Per-model output-token floor
+
+`gpt-6-luna` / `gpt-5.6-luna` return 200 then stream
+`Invalid 'max_output_tokens': integer below minimum value. Expected a value >=
+16, but got 8`. `max_tokens: 16` and `64` succeed. The extension's default is
+`options?.maxTokens ?? model.maxTokens ?? 8192`, which is safe — but the
+per-request floor varies by model and is not in the catalog, so a tiny
+`maxTokens` request (subagent/title roles) can fail on some models only.
+
+### 3.4 `CMD_ZDR=1` excludes non-ZDR models (422)
+
+`meta/muse-spark-1.3-contributor` has `zdr: false` in the catalog (its cheapness
+comes from Meta using the data for training) and answers
+`422 CMD_ZDR_NO_PROVIDERS … has no zero-data-retention upstream`. With ZDR off
+it returns 200 through the extension. This is working as intended and matches
+the README; the only gap is that the failure mode is a 422 the extension reports
+as a bare HTTP error.
+
+### 3.5 The "Go subscription does not permit API access" 403
+
+Not reproducible on this account through `/alpha/generate` — every probe of
+`meta/muse-spark-1.3-contributor` (and every other model) returns 200 or a
+`MODEL_NOT_IN_PLAN` 403, never the API-access message. That exact wording is
+emitted **only** by the Pro-gated compat endpoints; measured live:
+
+```
+POST /provider/v1/chat/completions
+403 {"error":{"message":"Your Go plan doesn't include API access. Upgrade to
+Provider or higher at https://commandcode.ai/billing to use these endpoints.",
+"type":"permission_error","code":"upgrade_required"}}
+```
+
+and `/provider/v1/messages` for that same model returns
+`Model "meta/muse-spark-1.3-contributor" is not supported on this endpoint.`
+
+Two candidate explanations, both consistent with the evidence `[INFERENCE]`:
+
+1. The request went out over a `/provider/v1/*` path rather than
+   `/alpha/generate` — a second `models.yml` provider pointing at
+   `https://api.commandcode.ai/provider/v1`, or a compat-mode client. Worth
+   checking `models.yml` before anything else; the extension is not the only
+   thing that can address this gateway.
+2. It predates the current subscription row
+   (`currentPeriodStart: 2026-10-30T19:51:08Z`); a request made before that had
+   no plan, and no plan fails closed on some paths.
+
+Either way, header fingerprinting is not implicated: dropping `User-Agent`,
+`x-session-id`, and `x-cli-environment` from the request each still returned 200
+for this model. If it recurs, capture the failing request's URL and headers
+before retrying.
+
+### 3.6 Consequence for the extension
+
+The `smol` role is configured as `commandcode/inclusionai/ling-3.1-flash-1019:free`,
+which now returns `429 RATE_LIMITED — You've used all 100 free Ling 3.1 Flash
+1019 requests for today`. The paid id `inclusionai/ling-3.1-flash` answers 200.
+The `task`/`tiny`/`commit` roles point at `poolside/laguna-s-2.1-free`, which is
+dead (§3.2). Both are user configuration, not extension bugs — but both were
+only discoverable by hand, which is what Phase 4 fixes.
+
+## 4. Plan
+
+Each phase is independently shippable. "Delete" items are code that exists only
+to serve a path this plan removes.
+
+### Phase 1 — Cost from catalog rates, nothing else
+
+1. Set each model's `cost` (`input`, `output`, `cacheRead`, `cacheWrite`) from
+   the catalog `pricing` fields (`inputCost`, `outputCost`, `cacheReadCost`,
+   `cacheWriteCost`, `cacheWrite1hCost`; USD per 1M tokens, pi's convention).
+2. Compute `usage.cost` locally in `stream.ts`; **delete**
+   `updateGatewayCost` and every `providerMetadata.gateway` /
+   `inferenceCost` reference, including the `finish`/`provider-metadata`
+   override path. Do not add a fallback that reads those fields.
 3. Honour `pricing.contextTiers` when present (none in today's catalog; the
    schema allows an ordered tier list keyed by `maxContext`).
 
-   The formula is already validated against live usage for
-   `deepseek/deepseek-v4-flash` (`inputCost 0.15`, `outputCost 0.6`,
-   `cacheReadCost 0.003`): a cold 762-in/1-out call prices at $1.149e-4, the
-   same call with 512 cache-read tokens at $3.964e-5 — the ~2.9× saving the
-   caching doc predicts.
-4. Add `usage.cacheWrite` from `finish.totalUsage.inputTokenDetails.cacheWriteTokens`
-   (currently hardcoded 0) and read the two new 1.88.2 events:
-   `provider-metadata` → `providerMetadata.anthropic.usage.cache_creation.ephemeral_1h_input_tokens`
-   into `cacheWrite1h`; `cache-write-tokens` → top-level `cacheWriteTokens`,
-   applied only when `finish` reported 0 (mirror the CLI's precedence).
-5. Tests: rate math for an uncached, a cache-read, and a 1h-cache-write turn;
-   override precedence; tier selection.
+   Validated live for `deepseek/deepseek-v4-flash` (`inputCost 0.15`,
+   `outputCost 0.6`, `cacheReadCost 0.003`): a cold 762-in/1-out call prices at
+   $1.149e-4; the same call with 512 cache-read tokens at $3.964e-5.
+4. Read `usage.cacheWrite` from `finish.totalUsage.inputTokenDetails.cacheWriteTokens`
+   instead of hardcoding 0, plus the two 1.88.2 events: `provider-metadata` →
+   `providerMetadata.anthropic.usage.cache_creation.ephemeral_1h_input_tokens`;
+   `cache-write-tokens` → top-level `cacheWriteTokens`, applied only when
+   `finish` reported 0.
+5. Tests: rate math for cold / cache-read / 1h-cache-write turns; tier
+   selection; `cache-write-tokens` precedence.
 
-Verification: a single live turn must meter a non-zero cost within ~1% of
-`/alpha/usage/summary` deltas for the same model.
+Verification: one live turn meters non-zero, within ~1% of the
+`/alpha/usage/summary` delta for the same model.
 
-### Phase 2 — Discovery: authoritative capabilities from the catalog
+### Phase 2 — One capability source: the gateway catalog
 
-Replace the models.dev join with `GET /provider/v1/models?view=client`, keeping
-models.dev only as a fallback for ids the catalog omits (currently: zero).
+**Delete models.dev entirely** — `MODELS_DEV_URL`, `fetchModelDevCaps`,
+`ModelDevEntry`, the `dev ? … : …` fallbacks in `mapDiscoveredModel`, and every
+comment describing the join. Replace `fetchLiveModelRows` with a catalog fetch.
 
-1. Parse `{schemaVersion, catalogVersion, refreshAfterSeconds, roles, data[]}`.
-   Reject `schemaVersion !== 1` and fall back rather than guessing
-   (`parseModelCatalog`'s rule). Reuse `cachedInputTokens`-style leniency
-   nowhere here: catalog fields are strict numbers.
-2. Map each row: `context_length` → `contextWindow`; `maxOutputTokens` →
-   `maxTokens` (fall back to the models.dev `limit.output`, then the current
-   8192, when `null` — 96 of 107 rows are `null`); `inputModalities.includes("image")`
-   → `input`; `reasoningEfforts.length > 0` → `reasoning`; `pricing` → `cost`
-   (Phase 1); `hidden` → drop; `aliases` → resolution; `zdr`/`category`/
-   `minimumPlan` → keep for filtering/reporting.
-3. Fix two live discrepancies the models.dev join creates today: it marks 13
-   models reasoning-capable whose catalog says they expose no effort control,
-   and it advertises `limit.output` 384000 for `deepseek/deepseek-v4-flash`
-   where the catalog says "unknown".
-4. Keep the existing `excludedModels` filter and the proprietary-prefix filter.
-   Re-check the prefix filter against `category: "premium"` (26 rows) — that
-   flag is the gateway's own "bills real credits" marker and is a better
-   filter than id prefixes `[INFERENCE on intent]`.
-5. Honour `roles` when choosing a default: `roles.default` plus
-   `roles.features.{vision,compaction,titleGeneration,toolDescription,…}`.
-   At minimum, use `roles.features.vision` to pick the model for image turns
-   `[INFERENCE]` — the extension cannot submit a second request, so this is
-   only actionable as a user-facing notice.
-6. Cache with the ETag (`if-none-match: "<catalogVersion>"` → 304) and respect
-   `refreshAfterSeconds` (currently 900) instead of refetching per startup;
-   `omp models refresh` must still force a refetch. Honour
-   `CMD_DISABLE_REMOTE_MODEL_CATALOG=1` as the CLI does.
+1. Fetch `GET /provider/v1/models?view=client`; parse
+   `{schemaVersion, catalogVersion, refreshAfterSeconds, roles, data[]}`. Reject
+   `schemaVersion !== 1` and register zero models rather than guessing —
+   the same fail-closed rule the extension already uses for roster failure, and
+   the same rule `parseModelCatalog` applies.
+2. Map each row 1:1, no cross-source merging:
+   `context_length` → `contextWindow`; `maxOutputTokens` → `maxTokens` (fall
+   back to a fixed default when `null` — 96 of 107 rows are `null`);
+   `inputModalities.includes("image")` → `input`; `reasoningEfforts.length > 0`
+   → `reasoning`; `pricing` → `cost` (Phase 1); `aliases` → id resolution;
+   `zdr`/`category`/`minimumPlan`/`hidden`/`behaviorProfile` → kept in a typed
+   model record (§3.1, Phase 3).
+3. Conditional GET with `if-none-match: "<catalogVersion>"` and respect
+   `refreshAfterSeconds` (900 today); honour `CMD_DISABLE_REMOTE_MODEL_CATALOG`
+   as the CLI does. `omp models refresh` must still force a fetch. The harness
+   already caches the discovered catalog, so no second cache.
+4. Drop the id-prefix heuristics (`PROPRIETARY_PREFIXES`) in favour of
+   `minimumPlan` filtering (§3.1): a prefix list is a guess that misses
+   `meta/muse-spark-1.3` and would wrongly hide a premium model if its id
+   changed. `excludedModels` stays — it is user intent, not a capability guess.
 
-### Phase 3 — Per-model wire quirks (`behaviorProfile`)
+Deleting models.dev removes an entire network dependency, a whole fallback
+ladder, and the two live disagreements it currently causes (13 reasoning flags,
+4 context windows). Nothing in the catalog requires a second opinion: for the
+72 ids both sources know, **vision flags agree 100%** and pricing agrees 100%
+(per-token rates are identical across all 72).
 
-1. Implement the table, keyed by the profile string on each catalog row:
+### Phase 3 — Plan-aware model registration (§3.1)
 
-   | profile                            | deferred tools | interleaved thinking | binds thinking to prefix | forced tool choice |
-   | ---------------------------------- | -------------- | -------------------- | ------------------------ | ------------------ |
-   | `standard-v1`                      | yes            | no                   | no                       | yes                |
-   | `no-deferred-tools-v1`             | no             | no                   | no                       | yes                |
-   | `private-reasoning-v1`             | no             | yes                  | no                       | yes                |
-   | `anthropic-interleaved-v1`         | yes            | yes                  | no                       | yes                |
-   | `anthropic-prefix-bound-v1`        | yes            | yes                  | yes                      | no                 |
-   | `anthropic-prefix-bound-forced-v1` | yes            | yes                  | yes                      | yes                |
+1. Fetch `/alpha/billing/subscriptions` and `/alpha/billing/credits` once per
+   discovery run, alongside the catalog.
+2. Port `evaluateModelAccess` faithfully: credits bypass, missing plan allows,
+   category access, `minimumPlan` rank order, and the `individual-go` family
+   limited to `opensource`.
+3. Drop models the account cannot use, instead of registering them to fail.
+   This is a behaviour change: `/model` will show only usable models. Keep the
+   drop silent per model but log one summary line (count by `minimumPlan`).
+4. Fail open when billing cannot be fetched (`fetchFailed` in the CLI's shape):
+   register everything and let the gateway reject, so an outage does not empty
+   the picker. This mirrors `as = {allowed: true}` in 1.88.2.
+5. Tests: the rank order, the credits bypass, category-only fallbacks, and the
+   fail-open path.
 
-   An unknown profile is the CLI's own "too old for the protocol" signal —
-   surface it in the status line rather than silently ignoring it.
-2. What each flag must change here:
-   - _interleaved thinking_: reasoning blocks may arrive **between** text/tool
-     blocks rather than only first. `BlockStreams` already keys blocks by id, so
-     this is likely already handled — add a test with an interleaved stream
-     rather than new code.
-   - _binds thinking to prefix_: prior reasoning must be replayed on assistant
-     history or the prefix stops matching `[INFERENCE from
-     `bindsThinkingToPrefix`]`. This is the one that interacts with the current
-     deliberate omission of reasoning from `convertMessages`.
-   - _deferred tools_: the CLI loads a `search_tools` meta-tool instead of
-     every schema. Not applicable — the harness owns tool selection; document
-     the divergence.
-   - _forced tool choice_: no `tool_choice` field exists anywhere in either
-     bundle (0 hits), so this flag is server-side only. Nothing to send.
-3. Tests: profile lookup, unknown-profile notice, interleaved stream ordering.
+### Phase 4 — Surface per-model failure reasons
 
-### Phase 4 — Reasoning effort plumbing
+§3.2 and §3.3 are gateway reality; the extension should not make them look like
+unknown breakage.
 
-1. Map `SimpleStreamOptions.reasoning` (`minimal|low|medium|high|xhigh|max`)
-   → `params.reasoning_effort`, clamped to the model's catalog
-   `reasoningEfforts`. Never send a value the model doesn't list — the gateway
-   accepts it and silently disables reasoning (measured).
-2. `disableReasoning: true` → send `"off"` when the model lists it, else omit.
-3. `reasoning: false` models: omit the field entirely.
-4. Live check per model family that the chosen effort actually produces
-   reasoning tokens; add a smoke script (not a unit test) because the mapping is
-   server-side.
+1. Parse the stream `error` event's real shape
+   (`{type, message, statusCode, isRetryable}`) and distinguish it from a
+   truncated stream ("no terminal event").
+2. Keep HTTP bodies verbatim: `MODEL_NOT_IN_PLAN`, `RATE_LIMITED`,
+   `CMD_ZDR_NO_PROVIDERS`, and the `Model '…' not found` stream error each
+   mean a different user action. A one-line mapping table in
+   `docs/troubleshooting.md` (status/code → cause → action) — the four causes in
+   §3 are the section.
+3. Honour `hidden`: hidden rows stay out of discovery, but keep the catalog
+   record so a user-supplied id still resolves with real capabilities.
+4. Document that a model absent from the roster but present in the catalog, or
+   dead in both, is a gateway-side condition (`poolside/laguna-s-2.1-free` is in
+   the plain roster today and dead), and recommend `omp models refresh`.
 
-### Phase 5 — Vision correctness
+### Phase 5 — Per-model quirks (`behaviorProfile`)
 
-1. Add `mimeType` to image parts (`{type:"image", image:"data:<mt>;base64,…",
-   mimeType:<mt>}`) — 1.88.2 adds it; the gateway accepts both.
+| profile                            | deferred tools | interleaved thinking | binds thinking to prefix | forced tool choice |
+| ---------------------------------- | -------------- | -------------------- | ------------------------ | ------------------ |
+| `standard-v1`                      | yes            | no                   | no                       | yes                |
+| `no-deferred-tools-v1`             | no             | no                   | no                       | yes                |
+| `private-reasoning-v1`             | no             | yes                  | no                       | yes                |
+| `anthropic-interleaved-v1`         | yes            | yes                  | no                       | yes                |
+| `anthropic-prefix-bound-v1`        | yes            | yes                  | yes                      | no                 |
+| `anthropic-prefix-bound-forced-v1` | yes            | yes                  | yes                      | yes                |
+
+1. Store the profile per model; an **unknown** profile is the CLI's own "this
+   client is too old" signal (`clientUpdateReason` → `client-update-required`) —
+   surface it in the status line rather than ignoring it.
+2. _interleaved thinking_: reasoning may arrive between text/tool blocks.
+   `BlockStreams` keys by id, so this is likely already correct — add a test with
+   an interleaved stream rather than new code.
+3. _binds thinking to prefix_: `[INFERENCE]` prior reasoning must be replayed on
+   assistant history or the prefix stops matching. This is the one divergence
+   worth revisiting, and it trades input tokens against cache hits — measure
+   before changing.
+4. _deferred tools_ / _forced tool choice_: no wire fields exist for either
+   (`tool_choice` has zero occurrences in both bundles). Document the divergence;
+   send nothing.
+
+### Phase 6 — Reasoning effort
+
+1. Map `SimpleStreamOptions.reasoning` (`minimal|low|medium|high|xhigh|max` →
+   wire) and **clamp to the model's catalog `reasoningEfforts`**, picking the
+   nearest supported value. Never send an unlisted value: the gateway accepts it
+   and silently disables reasoning (measured).
+2. `disableReasoning: true` → `"off"` when listed, else omit. Models with
+   `reasoning: false` → omit.
+3. Smoke-test per family that the chosen effort actually yields reasoning
+   tokens — the mapping is server-side and silent when wrong.
+
+### Phase 7 — Vision correctness
+
+1. Add `mimeType` to image parts; the gateway accepts both spellings, 1.88.2
+   sends it.
 2. Implement `stripImages` for text-only models, driven by catalog
    `inputModalities`: keep the newest image-bearing user message's images as
-   `<attached_image index="N">…image_index=N…` text, drop images from older user
-   messages, and use `[image omitted: the active model is text-only]` when a
-   message would otherwise empty. This replaces today's silent mis-description.
-3. Images in tool results: emit `output:{type:"content",value:[{type:"text"},
-   {type:"media",data,mediaType}]}` (accepted live) instead of the current
-   text-only `toWireToolOutput`-equivalent, if the harness surfaces them.
+   `<attached_image index="N">…` text, drop images from older user messages, use
+   `[image omitted: the active model is text-only]` when a message would empty.
+   Today this silently degrades — a red PNG to text-only
+   `deepseek/deepseek-v4-flash` answered "no image was provided".
+3. Tool-result images as `output:{type:"content",value:[{type:"text"},
+   {type:"media",data,mediaType}]}` (accepted live) where the harness surfaces
+   them.
 
-### Phase 6 — Terminal-event and error handling
+### Phase 8 — Docs and pin
 
-1. Handle the `error` event's real shape
-   (`{type:"error",error:{type,message,statusCode,isRetryable}}`) and keep the
-   existing rule that a stream without a terminal event throws; the message
-   should distinguish "gateway reported an error" from "truncated stream".
-2. Accept `refusal` in `resolveStopReason` (map to `stop` plus a surfaced
-   error message, since pi has no refusal reason).
-3. Consume `systemPromptTokens` from `finish` — additive to input accounting,
-   currently ignored `[INFERENCE: pi has no slot; decide display vs usage]`.
-4. Treat `pause_turn` as a tolerated terminal: if it ever appears, fail loudly
-   rather than reporting a truncated answer.
+1. Rewrite the two misleading `docs/wire-protocol.md` sections (cost, "every
+   field required") and append the §1 audit with method and date.
+2. Correct the README's cache-affinity claim (§2) and the `CMD_ZDR` guidance
+   with the `meta/muse-spark-1.3-contributor` example.
+3. Bump `COMMAND_CODE_VERSION` to `1.88.2` last; the status-line notice clears
+   itself.
 
-### Phase 7 — Docs and pin
+## 5. Deliberate non-goals
 
-1. Rewrite the two misleading sections of `docs/wire-protocol.md` (cost, "every
-   field required") and add the audit table from §1, with the date and method
-   for each verdict.
-2. Correct the README's cache-affinity claim (§2).
-3. Bump `COMMAND_CODE_VERSION` to `1.88.2` **last**, once the above lands; the
-   status-line notice clears itself when the pin matches npm.
-
-## 4. Deliberate non-goals
-
-- **No `mode` / `promptCache` on the wire.** `mode` is a CLI-side request class
-  (`tool-desc`, `compact`, `custom-agent`, …) and `promptCache` currently only
-  validates as `"off"` — sending either buys nothing for a chat turn. `mode`
-  omission is verified 200.
+- **No `mode` / `promptCache` on the wire.** `mode` is a CLI request class
+  (`tool-desc`, `compact`, `custom-agent`, …); `promptCache` currently validates
+  only as `"off"`. Neither buys anything for a chat turn; `mode` omission is
+  verified 200.
 - **No reasoning round-trip by default.** Replaying prior reasoning inflates
-  every request's input tokens. Revisit only if a `bindsThinkingToPrefix` model
-  shows a cache regression in Phase 3's measurements.
-- **No retries.** Unchanged guardrail; the harness owns retry/fallback.
+  every request's input. Revisit only if Phase 5's measurement shows a cache
+  regression on `bindsThinkingToPrefix` models.
+- **No retries.** The harness owns retry/fallback.
+- **No client-side model probing.** The extension will not call each model to
+  discover `max_tokens` floors (§3.3); it clamps to a safe default instead.
 
-## 5. Verification gates
+## 6. Verification gates
 
-Per phase: `bun run check`, `bun run lint`, `bun test`, then a live smoke with
-the extension's own `streamSimple` (not a hand-built body) against a cheap model,
-checking usage/cost, and — for anything touching request bytes — a second call
-on a warm prefix to confirm the cache still hits.
+Per phase: `bun run check`, `bun run lint`, `bun test`, then a live smoke through
+the extension's own `streamSimple` (not a hand-built body) against a cheap model.
+For anything touching request bytes, a second call on a warm prefix must still
+show a cache hit. For Phase 3, replay the §3 enumeration: every model the
+extension now registers must answer 200, and the 14 plan-gated ids must be
+absent.
