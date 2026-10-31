@@ -5,15 +5,21 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import registerCommandCode, { convertMessages, parseModelRows, readExcludedModels } from "../index.ts";
+import { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText, pickLatestStable } from "../update.ts";
 
 let provider;
 let agentDir;
 const realFetch = globalThis.fetch;
 
+const handlers = new Map();
+
 registerCommandCode({
 	registerProvider(name, config) {
 		assert.equal(name, "commandcode");
 		provider = config;
+	},
+	on(event, handler) {
+		handlers.set(event, handler);
 	},
 	pi: {
 		getAgentDir: () => agentDir,
@@ -1018,4 +1024,86 @@ test("readExcludedModels tolerates missing files and bad yaml", async () => {
       - ""
 `);
 	assert.deepEqual(await readExcludedModels(agentDir), new Set(["a/b"]));
+});
+
+// ---- CLI staleness notice ----------------------------------------------------
+
+const distTags = (tags) => new Response(JSON.stringify(tags), { status: 200 });
+
+// Mirrors the CLI's own updater: npm dist-tags, prereleases dropped, semver max.
+test("pickLatestStable drops prereleases and picks the semver max", () => {
+	assert.equal(pickLatestStable({ latest: "1.88.2", next: "2.0.0-rc.1" }), "1.88.2");
+	assert.equal(pickLatestStable({ latest: "1.9.0", rc: "1.10.0-rc.3", beta: "2.0.0-beta.0" }), "1.9.0");
+	assert.equal(pickLatestStable({ latest: "1.88.2-rc.0" }), null);
+	assert.equal(pickLatestStable({}), null);
+	assert.equal(pickLatestStable(null), null);
+});
+
+test("checkCliUpdate reports a newer release and stays silent when current", async () => {
+	mockFetch(async () => distTags({ latest: "1.88.2" }));
+	assert.deepEqual(await checkCliUpdate("0.52.1"), { latestVersion: "1.88.2", updateAvailable: true });
+
+	mockFetch(async () => distTags({ latest: "0.52.1" }));
+	assert.deepEqual(await checkCliUpdate("0.52.1"), { latestVersion: "0.52.1", updateAvailable: false });
+
+	mockFetch(async () => distTags({ latest: "0.51.0" }));
+	assert.deepEqual(await checkCliUpdate("0.52.1"), { latestVersion: "0.52.1", updateAvailable: false });
+});
+
+test("checkCliUpdate degrades to null on registry failure", async () => {
+	mockFetch(async () => new Response("nope", { status: 500 }));
+	assert.equal(await checkCliUpdate("0.52.1"), null);
+
+	mockFetch(async () => {
+		throw new Error("ENOTFOUND");
+	});
+	assert.equal(await checkCliUpdate("0.52.1"), null);
+
+	mockFetch(async () => new Response("<html>", { status: 200 }));
+	assert.equal(await checkCliUpdate("0.52.1"), null);
+
+	mockFetch(async () => distTags({ latest: "1.88.2-rc.0" }));
+	assert.equal(await checkCliUpdate("0.52.1"), null);
+});
+
+test("cliUpdateStatusText names both versions and the fix", () => {
+	const text = cliUpdateStatusText("0.52.1", "1.88.2");
+	assert.match(text, /0\.52\.1/);
+	assert.match(text, /1\.88\.2/);
+	assert.match(text, /stale/i);
+});
+
+test("session_start paints the status line only when the pin is stale", async () => {
+	const statuses = [];
+	const ctx = { ui: { setStatus: (key, text) => statuses.push([key, text]) } };
+
+	// session_start must not block startup on npm, so the handler returns before
+	// the check settles; drain the detached promise before asserting.
+	const settle = async () => {
+		for (let i = 0; i < 10; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+	};
+
+	mockFetch(async () => distTags({ latest: "1.88.2" }));
+	// Returns synchronously: the harness awaits session_start handlers, so an
+	// awaited npm round-trip would delay every session start.
+	assert.equal(handlers.get("session_start")({}, ctx), undefined);
+	await settle();
+	assert.equal(statuses.length, 1);
+	const [key, text] = statuses[0];
+	assert.equal(key, CLI_UPDATE_STATUS_KEY);
+	assert.match(text, /1\.88\.2/);
+
+	statuses.length = 0;
+	mockFetch(async () => distTags({ latest: "0.52.1" }));
+	await handlers.get("session_start")({}, ctx);
+	await settle();
+	assert.deepEqual(statuses, []);
+
+	statuses.length = 0;
+	mockFetch(async () => {
+		throw new Error("offline");
+	});
+	await handlers.get("session_start")({}, ctx);
+	await settle();
+	assert.deepEqual(statuses, []);
 });

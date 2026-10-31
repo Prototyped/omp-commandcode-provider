@@ -87,6 +87,7 @@ There is no model list in this extension. At startup the roster is discovered li
 - Response is **NDJSON** (newline-delimited JSON), not SSE — events like `reasoning-start/delta/end`, `text-start/delta/end`, `tool-input-start/delta/end`, `finish-step`
 - The extension translates the harness's native message format ↔ that wire shape and maps stream events onto the harness's `thinking_*` / `text_*` / `toolcall_*` events
 - Per-call cost is taken from the gateway's own `providerMetadata.gateway.cost` (accumulated across `finish-step` events; a terminal `finish` cost wins) and written to the session usage meter, since per-token rates don't exist for this plan
+- At startup it compares the pinned CLI version against npm's newest stable `command-code` release (the same source the CLI's own updater reads) and, when the pin is behind, shows `Command Code <latest> released · pin <old> stale` in the status line — the cue that the wire protocol needs re-deriving. The check is advisory: npm unreachable or current means no notice, and it never delays session start
 
 For the full, field-by-field contract, see the docs below.
 

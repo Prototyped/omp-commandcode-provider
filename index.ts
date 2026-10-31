@@ -19,12 +19,14 @@
  */
 import type { OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { BASE_URL } from "./constants.ts";
+import { BASE_URL, COMMAND_CODE_VERSION } from "./constants.ts";
 import { discoverModels } from "./discovery.ts";
 import { streamCommandCode } from "./stream.ts";
+import { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText } from "./update.ts";
 
 export { parseModelRows, readExcludedModels } from "./discovery.ts";
 export { convertMessages } from "./messages.ts";
+export { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText, pickLatestStable } from "./update.ts";
 
 // Mirrors the Command Code CLI's API-key login: only an explicit 401
 // rejects the key; a 403 or an unreachable endpoint keeps it.
@@ -65,5 +67,22 @@ export default function (pi: ExtensionAPI) {
 			login,
 		},
 		fetchDynamicModels: async (apiKey) => discoverModels(apiKey, pi.pi.getAgentDir()),
+	});
+
+	// The pinned CLI version is this extension's protocol contract, so a newer
+	// published CLI means the wire format needs re-deriving. Uses the CLI's own
+	// update mechanism (newest stable npm release) — the router has none.
+	// Detached: the harness awaits session_start handlers, and npm is not worth
+	// stalling a session start on.
+	pi.on("session_start", (_event, ctx) => {
+		void checkCliUpdate(COMMAND_CODE_VERSION)
+			.then((update) => {
+				if (!update?.updateAvailable) return;
+				ctx.ui.setStatus(
+					CLI_UPDATE_STATUS_KEY,
+					cliUpdateStatusText(COMMAND_CODE_VERSION, update.latestVersion),
+				);
+			})
+			.catch(() => {});
 	});
 }

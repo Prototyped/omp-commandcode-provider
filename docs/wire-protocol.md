@@ -49,6 +49,65 @@ The CLI also supports `--local` (`http://localhost:9090`) and `--staging`
 | `GET /provider/v1/models`    | live roster discovery at startup (public — answers unauthenticated); no static fallback in `index.ts` when unavailable |
 | `GET /alpha/billing/credits` | real credit balance (see `docs/caching.md`)                                                                            |
 
+`GET /provider/v1/models?view=client` (the CLI's model catalog) and
+`GET /alpha/lifecycle-events` are **not** used. Neither is a staleness signal:
+the router serves the identical catalog body whatever `x-command-code-version`
+says, and it has no version endpoint (`GET /versions` is 404).
+
+There is, however, a real gateway-side gate — a **floor**, not a ceiling.
+`/alpha/generate` validates `x-command-code-version` and rejects anything below
+its minimum with a 403 whose body carries the floor (verified live 2026-10-31):
+
+```json
+{
+	"error": {
+		"code": "upgrade_required",
+		"message": "Your Command Code CLI is out of date. Run `cmd update` or `npm i -g command-code` to upgrade.",
+		"minVersion": "0.18.10"
+	}
+}
+```
+
+`0.18.9`, `0.52`, `abc`, and a missing header all 403; `0.18.10` and above pass
+to body validation (400), as does `v0.52.1` (a leading `v` is tolerated). An
+ahead-of-server version is accepted, so the header is not a "is this client
+new enough for the protocol" check — it is a deprecation floor. `GET
+/alpha/whoami` and `GET /provider/v1/models` ignore it.
+
+The header value is the npm **package version**, unchanged in 1.88.2: both
+bundles derive it from `getPackageJson(...).version` (`Ps` in 0.52.1,
+`UF`/`HU`/`yJ` over `cliVersion` in 1.88.2), and intercepting the real 1.88.2
+CLI's `fetch` showed `x-command-code-version: 1.88.2` on all five requests it
+made (`/alpha/whoami` ×2, `/alpha/lifecycle-events`, `/alpha/fingerprint/record`,
+`/alpha/generate`). So the extension's pin is directly comparable to the npm
+release — which is what `update.ts` relies on.
+
+The CLI's own notion of "this client is too old for the _protocol_" is purely
+local: its catalog parser maps an unknown `behaviorProfile` onto
+`client-update-required`. That, plus npm's published version, is what
+`update.ts` uses (see "Staleness notice" below).
+
+### Staleness notice
+
+`COMMAND_CODE_VERSION` is a protocol pin, not an install dependency: a newer
+`command-code` release means the envelope in this document may have drifted.
+At `session_start` the extension asks npm for the newest **stable** release and,
+when the pin is behind, sets the status-line entry `commandcode-cli`
+(`ctx.ui.setStatus`) to `Command Code <latest> released · pin <old> stale`.
+
+This mirrors the CLI's own updater rather than inventing a new source: in the
+1.88.2 bundle `fetchVersions` shells out to `npm view command-code versions
+--json`, `isPrereleaseVersion` drops prereleases, `getLatestVersion` takes the
+semver maximum, and `determineUpdateTarget` compares it with the CLI's own
+version. `update.ts` asks npm's dist-tags document instead of the full
+packument (~90 bytes versus ~1.2 MB) and applies the same prerelease filter and
+semver max; `latest` advances with every stable publish, so the two agree.
+
+The check is detached (the harness awaits `session_start` handlers) and
+advisory: an unreachable registry, a non-200, an unparseable body, or a null
+result paints nothing. It also fetches nothing from `api.commandcode.ai`, so it
+works before login and does not depend on the key.
+
 ## Request
 
 ```

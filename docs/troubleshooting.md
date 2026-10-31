@@ -42,15 +42,54 @@ Causes, in order of likelihood:
 }
 ```
 
+### Cause 1 — you called a Pro-gated path
+
 You hit `/provider/v1/messages` or `/provider/v1/chat/completions`, which are
 Pro-gated. This extension does **not** use those — it uses `/alpha/generate`.
 If you see this, something is calling the compat endpoints directly (e.g. a
 `models.json` provider entry pointing at `https://api.commandcode.ai/provider/v1`).
 Remove that entry; let the extension own the `commandcode` provider.
 
+### Cause 2 — the CLI version is below the gateway's floor
+
+`/alpha/generate` validates the `x-command-code-version` header and rejects
+anything below its minimum with the _same_ `upgrade_required` code, plus a
+machine-readable floor:
+
+```json
+{
+	"error": {
+		"code": "upgrade_required",
+		"message": "Your Command Code CLI is out of date. Run `cmd update` or `npm i -g command-code` to upgrade.",
+		"minVersion": "0.18.10"
+	}
+}
+```
+
+Verified against the live gateway (2026-10-31): `0.18.9`, `0.52` (two-part),
+`v0.0.1`-style junk, and a missing header all 403; `0.18.10` and above 400 on
+the body schema instead, i.e. they pass the gate. `v0.52.1` passes too (the
+leading `v` is tolerated). The check is a floor only — there is **no upper
+bound**, so an ahead-of-server version is accepted. `GET /alpha/whoami` and
+`GET /provider/v1/models` do not gate on it.
+
+This is why `COMMAND_CODE_VERSION` matters for something other than
+bookkeeping: the extension reports its pin as the client version, so a pin
+below the floor breaks every turn. When you see this, bump the pin (see the
+next section for re-deriving the protocol). The status-line notice described
+below fires on the _reverse_ condition — a pin that is too **old relative to
+npm**, which also means it is eventually too old for the gateway.
+
 ## 400 — `BAD_REQUEST` (schema mismatch)
 
 This is the failure mode to expect when Command Code changes their CLI.
+
+The status line warns you before this happens: when the pinned
+`COMMAND_CODE_VERSION` is behind the newest published `command-code` release, a
+`commandcode-cli` entry reads `Command Code <latest> released · pin <old> stale`.
+That is the cue to re-derive the protocol from the new bundle (see
+`AGENTS.md`). No warning means npm could not be reached or the pin is current —
+the check is advisory and never blocks startup.
 
 ### Missing `config` fields
 
