@@ -1,4 +1,4 @@
-# pi-commandcode-provider
+# omp-commandcode-provider
 
 An extension for the [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) coding agent that adds [Command Code](https://commandcode.ai) as a model provider — DeepSeek V4 Pro/Flash, Kimi K3, GLM 5.2, MiniMax M3, Qwen 3.7 Max, Inkling, and the rest of the open-weight roster, all routable from inside omp.
 
@@ -45,7 +45,7 @@ falling back.
 ## Install
 
 ```bash
-omp install git+https://github.com/safzanpirani/pi-commandcode-provider
+omp install git+https://github.com/Prototyped/omp-commandcode-provider
 ```
 
 Or try it for one run without installing — clone the repo, `bun install`, then
@@ -110,8 +110,8 @@ Reverse-engineered reference for the undocumented endpoint this extension speaks
 ## Development
 
 ```bash
-git clone https://github.com/safzanpirani/pi-commandcode-provider
-cd pi-commandcode-provider
+git clone https://github.com/Prototyped/omp-commandcode-provider
+cd omp-commandcode-provider
 
 # Test it without installing
 omp -e . -p "say pong"     # with an interactive session: /login commandcode when it asks for a key

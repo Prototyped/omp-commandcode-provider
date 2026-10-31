@@ -1,5 +1,5 @@
 {
-	"name": "pi-commandcode-provider",
+	"name": "omp-commandcode-provider",
 	"version": "0.1.0",
 	"description": "omp extension that adds Command Code (commandcode.ai) as a model provider for the oh-my-pi harness. Routes requests through the same endpoint Command Code's own CLI uses, so the provider works on the Go plan without Pro-tier API access.",
 	"keywords": [
@@ -17,11 +17,11 @@
 	"author": "Safzan Pirani",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/safzanpirani/pi-commandcode-provider.git"
+		"url": "git+https://github.com/Prototyped/omp-commandcode-provider.git"
 	},
-	"homepage": "https://github.com/safzanpirani/pi-commandcode-provider#readme",
+	"homepage": "https://github.com/Prototyped/omp-commandcode-provider#readme",
 	"bugs": {
-		"url": "https://github.com/safzanpirani/pi-commandcode-provider/issues"
+		"url": "https://github.com/Prototyped/omp-commandcode-provider/issues"
 	},
 	"engines": {
 		"bun": ">=1.1.0"
