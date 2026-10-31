@@ -10,16 +10,22 @@ when it breaks, re-derive from the current CLI bundle (`$(npm root -g)/command-c
 
 The gateway exposes three model-traffic surfaces:
 
-| Path                               | Shape                       | Plan         |
-| ---------------------------------- | --------------------------- | ------------ |
-| `POST /provider/v1/messages`       | Anthropic Messages API      | **Pro only** |
-| `POST /provider/v1/chat/completions` | OpenAI Chat Completions   | **Pro only** |
-| `POST /alpha/generate`             | Custom (CLI's own envelope) | any plan     |
+| Path                                 | Shape                       | Plan         |
+| ------------------------------------ | --------------------------- | ------------ |
+| `POST /provider/v1/messages`         | Anthropic Messages API      | **Pro only** |
+| `POST /provider/v1/chat/completions` | OpenAI Chat Completions     | **Pro only** |
+| `POST /alpha/generate`               | Custom (CLI's own envelope) | any plan     |
 
 On the **Go** plan, both `/provider/v1/*` paths return:
 
 ```json
-{ "error": { "message": "Your Go plan doesn't include API access. Upgrade to Pro or higher…", "type": "permission_error", "code": "upgrade_required" } }
+{
+	"error": {
+		"message": "Your Go plan doesn't include API access. Upgrade to Pro or higher…",
+		"type": "permission_error",
+		"code": "upgrade_required"
+	}
+}
 ```
 
 `/alpha/generate` is what the `cmd` CLI itself uses for every turn, so it's not
@@ -35,12 +41,22 @@ https://api.commandcode.ai
 The CLI also supports `--local` (`http://localhost:9090`) and `--staging`
 (`https://staging-api.commandcode.ai`); not relevant here.
 
+### Other endpoints the extension touches
+
+| Path                         | Purpose                                                                                                                |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `GET /alpha/whoami`          | `/login commandcode` validates the pasted key here, mirroring the CLI; a 401 rejects the key, 403/unreachable keeps it |
+| `GET /provider/v1/models`    | live roster discovery at startup (public — answers unauthenticated); no static fallback in `index.ts` when unavailable |
+| `GET /alpha/billing/credits` | real credit balance (see `docs/caching.md`)                                                                            |
+
 ## Request
 
 ```
 POST /alpha/generate
 Authorization: Bearer user_xxxxxxxx…
 Content-Type: application/json
+Accept: application/x-ndjson
+User-Agent: cli
 x-cli-environment: production
 x-command-code-version: 0.52.1
 x-session-id: <uuid>
@@ -48,34 +64,47 @@ x-session-id: <uuid>
 x-cmd-zdr: 1
 ```
 
+`x-session-id` is a stable per-conversation UUID (the CLI uses its session's
+`crypto.randomUUID()`; the extension uses the harness `sessionId` when it is
+UUID-shaped, else a deterministic UUID derived from the working directory,
+system prompt, and opening user message). The same value is sent as the body's
+`threadId`; the gateway validates it as a strict RFC 4122 UUID. It keys the
+gateway's session state and prompt-cache affinity, so it must not change
+mid-conversation.
+
 Body:
 
 ```jsonc
 {
-  "config": {
-    "workingDir": "/path",
-    "date": "2026-05-28",
-    "environment": "production",
-    "structure": [],
-    "isGitRepo": false,
-    "currentBranch": "",
-    "mainBranch": "",
-    "gitStatus": "",
-    "recentCommits": []
-  },
-  "memory": "",            // string (NOT object — empty string is fine)
-  "taste": null,
-  "skills": null,
-  "permissionMode": "standard",
-  "params": {
-    "model": "deepseek/deepseek-v4-pro",   // canonical id from /provider/v1/models
-    "system": "…system prompt…",
-    "messages": [ /* Vercel AI SDK ModelMessage[] — see below */ ],
-    "tools": [ /* see below */ ],
-    "max_tokens": 32000,
-    "temperature": 0.7,    // optional
-    "stream": true         // always true in practice
-  }
+	"config": {
+		"workingDir": "/path",
+		"date": "2026-05-28",
+		"environment": "linux-x64, Node.js v24.21.0",
+		"structure": [],
+		"isGitRepo": false,
+		"currentBranch": "",
+		"mainBranch": "",
+		"gitStatus": "",
+		"recentCommits": []
+	},
+	"memory": "", // string (NOT object — empty string is fine)
+	"taste": null,
+	"skills": null,
+	"permissionMode": "standard",
+	"params": {
+		"model": "deepseek/deepseek-v4-pro", // canonical id from /provider/v1/models
+		"system": "…system prompt…",
+		"messages": [
+			/* Vercel AI SDK ModelMessage[] — see below */
+		],
+		"tools": [
+			/* see below */
+		],
+		"max_tokens": 32000,
+		"temperature": 0.7, // optional
+		"stream": true // always true in practice
+	},
+	"threadId": "<uuid>" // same value as the x-session-id header
 }
 ```
 
@@ -131,6 +160,10 @@ The three message roles:
 - `toolCallId` / `toolName` (camelCase, hyphen in `tool-call` / `tool-result`),
   not Anthropic's `tool_use` / `tool_use_id` / `id`.
 - Consecutive tool results merge into one `role:"tool"` message.
+- There is no image output for tool results (the CLI does the same): image
+  blocks that accompany a tool result ride back as their own `role:"user"`
+  message with `image` content parts, immediately after the `role:"tool"`
+  message.
 
 ### Tools
 
@@ -178,27 +211,30 @@ Event sequence for a typical tool-using turn:
 {"type":"tool-call","toolCallId":"call_00_…","toolName":"get_weather","input":{"location":"Paris"}}
 
 {"type":"finish-step","finishReason":"tool-calls","rawFinishReason":"tool_calls","usage":{ … },"providerMetadata":{ … }}
+{"type":"finish","finishReason":"stop","rawFinishReason":"stop","totalUsage":{ … }}
+{"type":"provider-metadata","providerMetadata":{ … }}
 ```
 
 ### Event reference
 
-| `type`              | Key fields                                 | Maps to pi event   |
-| ------------------- | ------------------------------------------ | ------------------ |
-| `start`             | —                                          | `start`            |
-| `start-step`        | `request.body` (echo of upstream request)  | (ignored)          |
-| `reasoning-start`   | `id`                                       | `thinking_start`   |
-| `reasoning-delta`   | `id`, `text`                               | `thinking_delta`   |
-| `reasoning-end`     | `id`                                       | `thinking_end`     |
-| `text-start`        | `id`                                       | `text_start`       |
-| `text-delta`        | `id`, `text`                               | `text_delta`       |
-| `text-end`          | `id`                                       | `text_end`         |
-| `tool-input-start`  | `id`, `toolName`                           | `toolcall_start`   |
-| `tool-input-delta`  | `id`, `delta` (JSON string chunk)          | `toolcall_delta`   |
-| `tool-input-end`    | `id`                                       | `toolcall_end`     |
-| `tool-call`         | `toolCallId`, `toolName`, `input` (full)   | `toolcall_end` (fallback) |
-| `finish-step`       | `finishReason`, `usage`, `providerMetadata`| `done`             |
-| `finish`            | `finishReason`, `totalUsage` in current flows | finalizes `done` |
-| `error`             | `error` or `message`                       | `error`            |
+| `type`              | Key fields                                  | Maps to harness event     |
+| ------------------- | ------------------------------------------- | ------------------------- |
+| `start`             | —                                           | `start`                   |
+| `start-step`        | `request.body` (echo of upstream request)   | (ignored)                 |
+| `reasoning-start`   | `id`                                        | `thinking_start`          |
+| `reasoning-delta`   | `id`, `text`                                | `thinking_delta`          |
+| `reasoning-end`     | `id`                                        | `thinking_end`            |
+| `text-start`        | `id`                                        | `text_start`              |
+| `text-delta`        | `id`, `text`                                | `text_delta`              |
+| `text-end`          | `id`                                        | `text_end`                |
+| `tool-input-start`  | `id`, `toolName`                            | `toolcall_start`          |
+| `tool-input-delta`  | `id`, `delta` (JSON string chunk)           | `toolcall_delta`          |
+| `tool-input-end`    | `id`                                        | `toolcall_end`            |
+| `tool-call`         | `toolCallId`, `toolName`, `input` (full)    | `toolcall_end` (fallback) |
+| `finish-step`       | `finishReason`, `usage`, `providerMetadata` | accumulates usage/cost    |
+| `finish`            | `finishReason`, `totalUsage`                | finalizes `done`          |
+| `provider-metadata` | `providerMetadata` (routing-specific)       | (consumed for cost)       |
+| `error`             | `error` or `message`                        | `error`                   |
 
 **Gotcha:** the per-delta tool events use field **`id`**, but the final
 redundant `tool-call` event uses **`toolCallId`**. If you key everything off
@@ -231,16 +267,18 @@ must emit one terminal result and reject EOF if neither event arrives.
 }
 ```
 
-**Important for cost math:** `inputTokens` is the *total* including cached
-tokens, following the Vercel AI SDK convention. Pi's `Usage` shape expects
+**Important for cost math:** `inputTokens` is the _total_ including cached
+tokens, following the Vercel AI SDK convention. The harness's `Usage` shape expects
 `input` and `cacheRead` to be **disjoint** (it computes
 `totalTokens = input + output + cacheRead + cacheWrite` and bills each
 separately). So the extension does `input = inputTokens - cachedInputTokens`.
 See `docs/caching.md`.
 
-### `providerMetadata` (in `finish-step`)
+### `providerMetadata` (in `finish-step` / terminal `provider-metadata`)
 
-Confirms the gateway is **Vercel AI Gateway**, and shows routing + real cost:
+Which keys appear depends on how the gateway routed the call. A call routed
+through **Vercel AI Gateway** carries `gateway` metadata with routing + real
+cost:
 
 ```jsonc
 "providerMetadata": {
@@ -254,6 +292,18 @@ Confirms the gateway is **Vercel AI Gateway**, and shows routing + real cost:
 }
 ```
 
-The `gateway.cost` field is the *actual* upstream USD cost, distinct from what
-the Go plan debits in credits (the plan applies per-model multipliers; see
-`README.md`).
+A call routed to a direct upstream instead carries that upstream's own key —
+e.g. `novita` with only prediction-token stats, and **no cost field**:
+
+```jsonc
+"providerMetadata": {
+  "novita": { "acceptedPredictionTokens": 0, "rejectedPredictionTokens": 0 }
+}
+```
+
+So `gateway.cost` is present only on some routings; the extension reads it
+when it exists and meters $0 when it doesn't. When present, `gateway.cost` is
+the _actual_ upstream USD cost, distinct from what the Go plan debits in
+credits (the plan applies per-model multipliers; see `README.md`). Costs from
+each `finish-step` accumulate, and a cost on the terminal `finish` /
+`provider-metadata` event overrides the accumulated total.

@@ -40,22 +40,23 @@ synthetic test suggests.
 ## Why the extension subtracts cached tokens from `input`
 
 The gateway reports `inputTokens` as the **total** input (cached + uncached).
-Pi's `Usage` type expects `input` and `cacheRead` to be **disjoint** — its
+The harness's `Usage` type (from `@oh-my-pi/pi-ai`) expects `input` and `cacheRead` to be **disjoint** — its
 `calculateCost()` multiplies each by a separate per-million rate, and computes
 `totalTokens = input + output + cacheRead + cacheWrite`. The built-in Anthropic
-provider in `pi-ai` follows the same disjoint convention.
+provider in `@oh-my-pi/pi-ai` follows the same disjoint convention.
 
 So leaving cached tokens inside `input` would **double-count** them and
 over-bill on any model with a non-zero `cost.input`. The extension does:
 
 ```ts
 const totalInputTokens = usage.inputTokens ?? 0;
-const cacheReadTokens  = usage.cachedInputTokens
-  ?? usage.inputTokenDetails?.cacheReadTokens
-  ?? usage.raw?.prompt_cache_hit_tokens
-  ?? 0;
+const cacheReadTokens =
+	usage.cachedInputTokens ??
+	usage.inputTokenDetails?.cacheReadTokens ??
+	usage.raw?.prompt_cache_hit_tokens ??
+	0;
 
-output.usage.input     = Math.max(0, totalInputTokens - cacheReadTokens);
+output.usage.input = Math.max(0, totalInputTokens - cacheReadTokens);
 output.usage.cacheRead = cacheReadTokens;
 ```
 

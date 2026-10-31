@@ -1,49 +1,56 @@
 {
-  "name": "pi-commandcode-provider",
-  "version": "0.1.0",
-  "description": "Pi extension that adds Command Code (commandcode.ai) as a model provider. Routes requests through the same endpoint Command Code's own CLI uses, so the provider works on the Go plan without Pro-tier API access.",
-  "keywords": [
-    "pi",
-    "pi-package",
-    "pi-extension",
-    "commandcode",
-    "deepseek",
-    "kimi",
-    "qwen",
-    "glm",
-    "minimax",
-    "mimo"
-  ],
-  "type": "module",
-  "license": "MIT",
-  "author": "Safzan Pirani",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/safzanpirani/pi-commandcode-provider.git"
-  },
-  "homepage": "https://github.com/safzanpirani/pi-commandcode-provider#readme",
-  "bugs": {
-    "url": "https://github.com/safzanpirani/pi-commandcode-provider/issues"
-  },
-  "engines": {
-    "node": ">=20.0.0"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
-  },
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
-  "scripts": {
-    "check": "tsrs --noEmit",
-    "test": "node --experimental-strip-types --test test/*.test.mjs"
-  },
-  "devDependencies": {
-    "@types/node": "^22.15.29",
-    "tsrs": "0.16.0-ts7.1.0-dev.20260929",
-    "typescript": "^5.9.2"
-  }
+	"name": "pi-commandcode-provider",
+	"version": "0.1.0",
+	"description": "omp extension that adds Command Code (commandcode.ai) as a model provider for the oh-my-pi harness. Routes requests through the same endpoint Command Code's own CLI uses, so the provider works on the Go plan without Pro-tier API access.",
+	"keywords": [
+		"omp",
+		"commandcode",
+		"deepseek",
+		"kimi",
+		"qwen",
+		"glm",
+		"minimax",
+		"mimo"
+	],
+	"type": "module",
+	"license": "MIT",
+	"author": "Safzan Pirani",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/safzanpirani/pi-commandcode-provider.git"
+	},
+	"homepage": "https://github.com/safzanpirani/pi-commandcode-provider#readme",
+	"bugs": {
+		"url": "https://github.com/safzanpirani/pi-commandcode-provider/issues"
+	},
+	"engines": {
+		"bun": ">=1.1.0"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-ai": ">=18.0.0",
+		"@oh-my-pi/pi-coding-agent": ">=18.0.0"
+	},
+	"omp": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"check": "tsrs --noEmit",
+		"lint": "biome check .",
+		"format": "biome format --write .",
+		"test": "bun test"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.6.4",
+		"@oh-my-pi/pi-ai": "^18.14.0",
+		"@oh-my-pi/pi-coding-agent": "^18.14.0",
+		"@types/js-yaml": "^4.0.9",
+		"@types/node": "^22.15.29",
+		"tsrs": "0.16.0-ts7.1.0-dev.20260929",
+		"typescript": "^5.9.2"
+	},
+	"dependencies": {
+		"js-yaml": "^5.5.0"
+	}
 }

@@ -1,29 +1,42 @@
 # pi-commandcode-provider
 
-A [pi](https://github.com/earendil-works/pi-mono) extension that adds [Command Code](https://commandcode.ai) as a model provider — DeepSeek V4 Pro/Flash, Kimi K3, GLM 5.2, MiniMax M3, Qwen 3.7 Max, Inkling, and the rest of the open-weight roster, all routable from inside pi.
+An extension for the [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) coding agent that adds [Command Code](https://commandcode.ai) as a model provider — DeepSeek V4 Pro/Flash, Kimi K3, GLM 5.2, MiniMax M3, Qwen 3.7 Max, Inkling, and the rest of the open-weight roster, all routable from inside omp.
+
+> **Fork.** This is a hard fork of [safzanpirani/pi-commandcode-provider](https://github.com/safzanpirani/pi-commandcode-provider), retargeted from the original pi harness to the [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) harness.
 
 > **Unofficial.** Reverse-engineered from the `command-code` npm CLI (currently verified against v0.52.1). Not affiliated with or endorsed by Command Code / Langbase. Schema is undocumented and can change without notice.
 
 ## Why this exists
 
-Command Code's `/provider/v1/messages` and `/provider/v1/chat/completions` **generation** endpoints require the **Provider plan or higher**. The **Go plan** ($1/month with $10 of credits and per-model multipliers, e.g. ~$40 of DeepSeek V4 Pro) doesn't expose them. (The `GET /provider/v1/models` _list_ endpoint is readable on Go — handy for discovering ids — but generation isn't.)
+Command Code's `/provider/v1/messages` and `/provider/v1/chat/completions` **generation** endpoints require the **Provider plan or higher**. The **Go plan** ($1/month with $10 of credits and per-model multipliers, e.g. ~$40 of DeepSeek V4 Pro) doesn't expose them. (`GET /provider/v1/models` is public — it answers unauthenticated — but generation is gated.)
 
 This extension instead talks to `/alpha/generate`, the endpoint the Command Code CLI (`cmd`) uses for every model call. It's not plan-gated, so any account that can run `cmd` can use it. The trade-off is that the request/response shape is undocumented and Vercel-AI-SDK-flavored, not OpenAI- or Anthropic-shaped — hence the extension.
 
 ## Configure
 
-Set your Command Code API key as an env var. You can mint one at [commandcode.ai/settings](https://commandcode.ai/settings) (it looks like `user_…`):
+Log in with your Command Code API key (mint one at [commandcode.ai/settings](https://commandcode.ai/settings), it looks like `user_…`):
+
+```
+/login commandcode
+```
+
+The key is validated against `GET /alpha/whoami` (the same check the `cmd` CLI makes) and stored in the harness credential store. A 401 rejects the key; a 403 or an unreachable endpoint keeps it, matching CLI behavior.
+
+Fallbacks, in order: an `apiKey` on the `commandcode` provider entry in your `models.yml`, then the `COMMANDCODE_API_KEY` environment variable:
+
+```yaml
+# models.yml
+providers:
+  commandcode:
+    apiKey: user_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
 
 ```bash
+# or
 export COMMANDCODE_API_KEY=user_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Verify the key is live:
-
-```bash
-curl -sS https://api.commandcode.ai/alpha/whoami \
-  -H "Authorization: Bearer $COMMANDCODE_API_KEY"
-```
+A saved `/login` key wins over both fallbacks.
 
 Optional: set `CMD_ZDR=1` to send Command Code's strict zero-data-retention
 header. Models without a ZDR-capable upstream will fail with `422` instead of
@@ -32,68 +45,48 @@ falling back.
 ## Install
 
 ```bash
-pi install git:github.com/safzanpirani/pi-commandcode-provider
+omp install git+https://github.com/safzanpirani/pi-commandcode-provider
 ```
 
-Or try it for one run without installing:
-
-```bash
-pi -e git:github.com/safzanpirani/pi-commandcode-provider
-```
+Or try it for one run without installing — clone the repo, `bun install`, then
+`omp -e .` (see [Development](#development)).
 
 ## Use
 
 ```bash
-pi --model "commandcode/deepseek/deepseek-v4-pro" -p "what is 17 * 23?"
-pi --model "commandcode/moonshotai/Kimi-K2.6" -p "draft a haiku about caching"
+omp --model "commandcode/deepseek/deepseek-v4-pro" -p "what is 17 * 23?"
+omp --model "commandcode/moonshotai/Kimi-K2.6" -p "draft a haiku about caching"
 ```
 
-`pi --list-models | grep commandcode` shows everything registered.
+`omp models commandcode` shows everything registered.
 
 ## Models
 
-Pulled from `GET /provider/v1/models` and the CLI registry, then registered with the canonical id the gateway expects. All support text; models marked by the CLI as multimodal also accept image input. This is the **open-weight** roster; proprietary frontier models are omitted by default (see below).
+There is no model list in this extension. At startup the roster is discovered live from `GET /provider/v1/models` (public — no auth required), and the capability data the roster lacks (reasoning/vision flags, output caps) is fetched from the [models.dev](https://models.dev) `commandcode` catalog. The harness caches the discovered catalog across startups; run `omp models refresh` to force a re-fetch.
 
-| Model id                              | Display name              | Context | Max out |
-| ------------------------------------- | ------------------------- | ------- | ------- |
-| `deepseek/deepseek-v4-pro`            | DeepSeek V4 Pro           | 1M      | 128K    |
-| `deepseek/deepseek-v4-flash`          | DeepSeek V4 Flash         | 1M      | 128K    |
-| `moonshotai/Kimi-K3`                  | Kimi K3                   | 1M      | 64K     |
-| `moonshotai/Kimi-K2.7-Code`           | Kimi K2.7 Code            | 256K    | 64K     |
-| `moonshotai/Kimi-K2.7-Code-Highspeed` | Kimi K2.7 Code HighSpeed  | 262K    | 64K     |
-| `moonshotai/Kimi-K2.6`                | Kimi K2.6                 | 256K    | 64K     |
-| `moonshotai/Kimi-K2.5`                | Kimi K2.5                 | 256K    | 64K     |
-| `zai-org/GLM-5.2`                     | GLM 5.2                   | 1M      | 128K    |
-| `zai-org/GLM-5.2-Fast`                | GLM 5.2 Fast              | 1M      | 64K     |
-| `zai-org/GLM-5.1`                     | GLM 5.1                   | 200K    | 32K     |
-| `zai-org/GLM-5`                       | GLM 5                     | 200K    | 32K     |
-| `MiniMaxAI/MiniMax-M3`                | MiniMax M3                | 1M      | 128K    |
-| `MiniMaxAI/MiniMax-M2.7`              | MiniMax M2.7              | 200K    | 64K     |
-| `MiniMaxAI/MiniMax-M2.5`              | MiniMax M2.5              | 200K    | 64K     |
-| `xiaomi/mimo-v2.5-pro`                | MiMo V2.5 Pro             | 1M      | 128K    |
-| `xiaomi/mimo-v2.5`                    | MiMo V2.5                 | 1M      | 128K    |
-| `Qwen/Qwen3.7-Max`                    | Qwen 3.7 Max              | 1M      | 128K    |
-| `Qwen/Qwen3.7-Plus`                   | Qwen 3.7 Plus             | 1M      | 128K    |
-| `Qwen/Qwen3.6-Max-Preview`            | Qwen 3.6 Max Preview      | 200K    | 32K     |
-| `Qwen/Qwen3.6-Plus`                   | Qwen 3.6 Plus             | 200K    | 32K     |
-| `stepfun/Step-3.7-Flash`             | Step 3.7 Flash            | 256K    | 64K     |
-| `stepfun/Step-3.5-Flash`             | Step 3.5 Flash            | 1M      | 128K    |
-| `tencent/Hy3`                         | Tencent Hy3               | 262K    | 64K     |
-| `nvidia/nemotron-3-ultra-550b-a55b`   | Nemotron 3 Ultra          | 1M      | 128K    |
-| `thinkingmachines/inkling`            | Inkling                    | 256K    | 64K     |
+- **Reasoning/vision** flags and per-call output caps come from models.dev; the context window comes from the gateway row's `context_length` (128K fallback). A model models.dev doesn't know about — its catalog lags the gateway's live list — is assumed reasoning-capable (most new models are) and text-only.
+- **Hide a model:** list its id under `excludedModels` in `models.yml`:
 
-**Proprietary models (omitted by default).** Command Code also serves `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-fable-5`, `claude-haiku-4-5-20251001`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `google/gemini-3.5-flash`, and `google/gemini-3.1-flash-lite` over the same envelope. They bill real plan credits and are usually cheaper elsewhere, so they aren't registered here.
+  ```yaml
+  providers:
+    commandcode:
+      excludedModels:
+        - "Qwen/Qwen3.7-Max"
+  ```
+- **If discovery fails** (endpoint down, or its response shape changed), the provider registers with no models — there is deliberately no static fallback to serve stale. `omp models commandcode` shows nothing until the next startup succeeds, or until `omp models refresh`.
 
-To add any model, append a `ModelDef` to the `MODELS` array in `index.ts` — every id in the gateway's `GET /provider/v1/models` list works.
+**Proprietary models (omitted by default).** The gateway also lists proprietary frontier models (ids with the `claude-`, `gpt-`, and `google/gemini-` prefixes). They bill real plan credits and are usually cheaper elsewhere, so discovery filters them out (see `PROPRIETARY_PREFIXES` in `index.ts`).
 
 ## How it works
 
+- Resolves the key as `/login` credential → `models.yml` `apiKey` → `COMMANDCODE_API_KEY`, discovers the roster from the public `GET /provider/v1/models` plus capability data from the models.dev `commandcode` catalog (no models if discovery fails), and filters proprietary prefixes and `models.yml` `excludedModels`
 - POST `https://api.commandcode.ai/alpha/generate` with `Authorization: Bearer <key>`
-- Body is a wrapped envelope: `{ config, memory, taste, skills, permissionMode, params }` where `params` carries the actual `{ model, system, messages, tools, max_tokens, stream }`
+- Body is a wrapped envelope: `{ config, memory, taste, skills, permissionMode, params, threadId }` where `params` carries the actual `{ model, system, messages, tools, max_tokens, stream }`. `threadId` (a strict RFC 4122 UUID, mirrored in the `x-session-id` header) is stable per conversation — the harness `sessionId` when available, else derived deterministically from the working directory, system prompt, and opening message — so the gateway's prompt-cache affinity holds across turns
 - `config`, `memory`, `taste`, and `skills` are static neutral defaults in `index.ts`. A fork that wants Command Code's workspace/taste context can replace `staticConfig()` and those sidecar fields without touching message or stream parsing.
 - Messages use the [Vercel AI SDK `ModelMessage` schema](https://sdk.vercel.ai/docs) — `tool-call` parts on assistant messages, `role: "tool"` + `tool-result` parts for tool outputs (not Anthropic content blocks, not OpenAI tool messages)
 - Response is **NDJSON** (newline-delimited JSON), not SSE — events like `reasoning-start/delta/end`, `text-start/delta/end`, `tool-input-start/delta/end`, `finish-step`
-- The extension translates pi's native message format ↔ that wire shape and maps stream events onto pi's `thinking_*` / `text_*` / `toolcall_*` events
+- The extension translates the harness's native message format ↔ that wire shape and maps stream events onto the harness's `thinking_*` / `text_*` / `toolcall_*` events
+- Per-call cost is taken from the gateway's own `providerMetadata.gateway.cost` (accumulated across `finish-step` events; a terminal `finish` cost wins) and written to the session usage meter, since per-token rates don't exist for this plan
 
 For the full, field-by-field contract, see the docs below.
 
@@ -107,10 +100,11 @@ Reverse-engineered reference for the undocumented endpoint this extension speaks
 
 ## Caveats
 
+- **Discovery is live and uncached here.** The roster comes from the public `GET /provider/v1/models` and capability flags from the models.dev `commandcode` catalog, fetched each startup. If either is unreachable, the provider registers with no models — there is no bundled fallback to serve stale. Run `omp models refresh` to re-fetch.
 - **Undocumented endpoint.** `/alpha/generate` isn't a published API surface. Command Code can change the schema at any time. If they tighten the request shape, expect 400 errors until the extension is updated. For request-schema 400s, first compare the outgoing body in `index.ts` against the current CLI envelope: `config.{workingDir, date, environment, structure, isGitRepo, currentBranch, mainBranch, gitStatus, recentCommits}`, `memory: string`, `taste`, `skills`, `permissionMode`, and `params.{model, system, messages, tools, max_tokens, stream}`.
 - **Tier policy.** This extension uses an endpoint the official CLI uses, on credentials your plan grants. Command Code may consider that fair game or may not; their published "API access" feature still requires the Pro plan. If your account gets flagged or rate-limited, that's the realistic downside.
-- **Vision depends on the model.** Kimi K3/K2.x, MiniMax M3, Qwen 3.7 Plus, Step 3.7 Flash, and Inkling currently declare image input.
-- **Cost is reported as $0** by pi. The Go plan applies per-model multipliers (e.g. $10 credits ↔ ~$40 of DeepSeek usage) that don't map cleanly to per-token pricing. Real balance: `curl -H "Authorization: Bearer $COMMANDCODE_API_KEY" https://api.commandcode.ai/alpha/billing/credits`.
+- **Vision depends on the model.** Image input is taken from models.dev's `attachment` flag per model; a model it doesn't list is assumed text-only.
+- **Cost comes from the gateway, not token rates.** Per-model rates are set to $0 (the Go plan's per-model multipliers don't map to per-token pricing); the session meter instead shows the gateway's reported upstream USD cost from `providerMetadata.gateway.cost`. If a response omits it, that call meters $0. Real balance: `curl -H "Authorization: Bearer $COMMANDCODE_API_KEY" https://api.commandcode.ai/alpha/billing/credits`.
 - **Reasoning is heavy.** DeepSeek V4 Pro and Qwen 3.7 Max emit a lot of reasoning tokens by default. A short answer can cost 10–30× the input. Budget accordingly on the Go plan.
 
 ## Development
@@ -120,15 +114,17 @@ git clone https://github.com/safzanpirani/pi-commandcode-provider
 cd pi-commandcode-provider
 
 # Test it without installing
-COMMANDCODE_API_KEY=user_... pi -e . -p "say pong"
+omp -e . -p "say pong"     # with an interactive session: /login commandcode when it asks for a key
+# (COMMANDCODE_API_KEY still works as a fallback)
 
-# Type-check
-npm install
-npm run check
-npm test
+# Install deps, type-check, lint+format, test (all via bun)
+bun install
+bun run check
+bun run lint
+bun test
 ```
 
-Pi loads `.ts` files directly, so there's no build step.
+The omp harness runs on bun, so that's the toolchain here too. omp loads `.ts` files directly, so there's no build step.
 
 ## License
 
