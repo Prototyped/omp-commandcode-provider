@@ -8,8 +8,16 @@ export const BASE_URL = "https://api.commandcode.ai";
 // access" for models this extension serves fine over /alpha/generate.
 export const PROVIDER_ID = "commandcode-alpha";
 export const MODELS_ENDPOINT = "/provider/v1/models";
+// `view=client` returns the CLI's model catalog: capabilities, pricing, plan
+// gates and aliases — everything models.dev used to approximate.
+export const CATALOG_ENDPOINT = `${MODELS_ENDPOINT}?view=client`;
 export const ENDPOINT = "/alpha/generate";
 // Mirrors the `x-command-code-version` the CLI sends (its package version).
-// Keep in step with the installed `command-code` package; stale values risk
-// being rejected or flagged by the gateway.
-export const COMMAND_CODE_VERSION = "0.52.1";
+// Keep in step with the `command-code` npm release whose wire protocol this
+// implementation matches — it is a protocol-version marker, not a dependency.
+export const COMMAND_CODE_VERSION = "1.88.2";
+// The gateway rejects params.max_tokens above this with 400 "Too big:
+// expected number to be <=200000" (verified 2026-10-31 for deepseek, glm and
+// kimi models alike) — the CLI never sends more (its default is 64e3).
+export const MAX_OUTPUT_TOKENS_CAP = 200_000;
+export const DEFAULT_OUTPUT_TOKENS = 64_000;

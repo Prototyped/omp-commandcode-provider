@@ -97,17 +97,6 @@ function toolEventName(event: GatewayEvent): string {
 
 // The gateway reports costs as strings in current flows ("0.000065598");
 // older or third-party gateways may send numbers. Accept both, reject junk.
-// Catalog fields (roster rows, models.dev) are strict numbers — those use
-// `finiteNumber` (discovery.ts).
-function toFiniteNumber(value: unknown): number | undefined {
-	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
-	if (typeof value === "string" && value !== "") {
-		const parsed = Number(value);
-		return Number.isFinite(parsed) ? parsed : undefined;
-	}
-	return undefined;
-}
-
 // ---- Request construction -------------------------------------------------
 
 // The /alpha/generate schema is strict — all of these fields are required.
@@ -379,7 +368,7 @@ type GatewayUsage = {
 	outputTokens?: number;
 	output_tokens?: number;
 	cachedInputTokens?: number;
-	inputTokenDetails?: { cacheReadTokens?: number };
+	inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
 	raw?: { prompt_cache_hit_tokens?: number };
 };
 
@@ -392,28 +381,32 @@ function applyUsage(usage: AssistantMessage["usage"], raw: GatewayUsage): void {
 	const totalInputTokens = raw.inputTokens ?? raw.input_tokens ?? 0;
 	const cacheReadTokens =
 		raw.cachedInputTokens ?? raw.inputTokenDetails?.cacheReadTokens ?? raw.raw?.prompt_cache_hit_tokens ?? 0;
-	usage.input = Math.max(0, totalInputTokens - cacheReadTokens);
+	const cacheWriteTokens = raw.inputTokenDetails?.cacheWriteTokens ?? 0;
+	usage.input = Math.max(0, totalInputTokens - cacheReadTokens - cacheWriteTokens);
 	usage.output = raw.outputTokens ?? raw.output_tokens ?? 0;
 	usage.cacheRead = cacheReadTokens;
-	usage.cacheWrite = 0;
+	usage.cacheWrite = cacheWriteTokens;
 	usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
-// The gateway reports the real upstream USD cost in providerMetadata.gateway
-// (a string in current flows; `inferenceCost` as the older spelling). Prefer
-// it over local per-token rates: the Go plan's per-model multipliers don't
-// map cleanly to rate-based estimates. `finish` and `provider-metadata` are
-// terminal: when they report a cost, that is the whole request (override).
-// `finish-step` events carry per-step cost, so sum those.
-function updateGatewayCost(
-	current: number,
-	type: "finish-step" | "finish" | "provider-metadata",
-	event: GatewayEvent,
-): number {
-	const gateway = event.providerMetadata?.gateway;
-	const reported = toFiniteNumber(gateway?.cost) ?? toFiniteNumber(gateway?.inferenceCost);
-	if (reported === undefined) return current;
-	return type === "finish" || type === "provider-metadata" ? reported : current + reported;
+// The gateway reports usage only — `providerMetadata.gateway.cost` /
+// `.inferenceCost` were never observed on any stream (contrary to earlier
+// revisions of docs/wire-protocol.md) — so cost comes from the catalog's
+// `pricing` rates carried on the model, the same math 1.88.2 performs
+// (`estimateCatalogCostUsd`). Verified live for deepseek/deepseek-v4-flash
+// (inputCost 0.15, outputCost 0.6, cacheReadCost 0.003): a cold 762-in/1-out
+// call prices at $1.149e-4; with 512 cache-read tokens at $3.964e-5.
+function computeCost(model: Model<Api>, usage: AssistantMessage["usage"]): number {
+	// `usage.cost` holds USD amounts (the harness meter reads `.total`); the
+	// per-million rates live on the discovered model, not the message.
+	const { input, output, cacheRead, cacheWrite } = model.cost;
+	const uncached = Math.max(0, usage.input);
+	usage.cost.input = (uncached * input) / 1_000_000;
+	usage.cost.output = (usage.output * output) / 1_000_000;
+	usage.cost.cacheRead = (usage.cacheRead * cacheRead) / 1_000_000;
+	usage.cost.cacheWrite = (usage.cacheWrite * cacheWrite) / 1_000_000;
+	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	return usage.cost.total;
 }
 
 // Normalize the gateway's finishReason onto pi's stop reasons. Some OSS
@@ -467,7 +460,11 @@ export function streamCommandCode(
 
 			const blocks = new BlockStreams(output, stream);
 			let sawTerminalEvent = false;
-			let gatewayCost = 0;
+			// `cache-write-tokens` (top-level number) patches cacheWrite only when
+			// `finish` reported 0; `provider-metadata` supplies the Anthropic 1h
+			// cache-write split via providerMetadata. Both new in 1.88.2.
+			let cacheWriteTokensPatch: number | undefined;
+			let cacheWrite1hTokens: number | undefined;
 
 			for await (const event of ndjsonLines(response.body)) {
 				if (!event || typeof event !== "object") continue;
@@ -512,31 +509,54 @@ export function streamCommandCode(
 						break;
 					}
 					case "finish-step":
-					case "finish":
-					case "provider-metadata": {
+					case "finish": {
 						sawTerminalEvent = true;
 						const usage = gatewayEvent.usage ?? gatewayEvent.totalUsage;
 						if (usage) applyUsage(output.usage, usage);
-						gatewayCost = updateGatewayCost(gatewayCost, type, gatewayEvent);
 						output.stopReason = resolveStopReason(
 							gatewayEvent.finishReason ?? gatewayEvent.rawFinishReason,
 							blocks.sawToolCall(),
 						);
 						break;
 					}
-					case "error":
-						throw new Error(
-							gatewayEvent.message ??
-								(gatewayEvent.error === undefined
-									? "Command Code stream error"
-									: stringifyUnknown(gatewayEvent.error)),
-						);
+					case "cache-write-tokens": {
+						const n = gatewayEvent.cacheWriteTokens;
+						if (typeof n === "number" && Number.isFinite(n) && n >= 0) cacheWriteTokensPatch = n;
+						break;
+					}
+					case "provider-metadata": {
+						const anthropic = gatewayEvent.providerMetadata?.anthropic;
+						const n = anthropic?.usage?.cache_creation?.ephemeral_1h_input_tokens;
+						if (typeof n === "number" && Number.isFinite(n) && n >= 0) cacheWrite1hTokens = n;
+						break;
+					}
+					case "error": {
+						const err = gatewayEvent.error;
+						const detail =
+							err && typeof err === "object"
+								? `${(err as GatewayEvent).type ?? "error"}: ${(err as GatewayEvent).message ?? stringifyUnknown(err)}`
+								: (gatewayEvent.message ??
+									(gatewayEvent.error === undefined
+										? "Command Code stream error"
+										: stringifyUnknown(gatewayEvent.error)));
+						throw new Error(`Command Code stream error: ${detail}`);
+					}
 				}
 			}
-			// The session meter reads cost.total; the gateway's reported upstream
-			// USD cost is the best number available — Go plan credit multipliers
-			// are not per-token, so local rate estimates would be misleading.
-			output.usage.cost.total = gatewayCost;
+			// The session meter reads cost.total. The gateway reports no per-request
+			// USD on /alpha/generate, so the cost is the catalog rate math.
+			if (cacheWrite1hTokens !== undefined) {
+				// The 1h split is a subset of cacheWrite; keep them disjoint for pi's
+				// usage shape by folding 1h into cacheWrite and pricing separately
+				// is unnecessary — catalog cacheWriteCost applies to both tiers.
+				output.usage.cacheWrite += Math.max(0, cacheWrite1hTokens - output.usage.cacheWrite);
+				output.usage.totalTokens += Math.max(0, cacheWrite1hTokens - output.usage.cacheWrite);
+			}
+			if (cacheWriteTokensPatch !== undefined && output.usage.cacheWrite === 0) {
+				output.usage.cacheWrite = cacheWriteTokensPatch;
+				output.usage.totalTokens += cacheWriteTokensPatch;
+			}
+			output.usage.cost.total = computeCost(model, output.usage);
 			if (!sawTerminalEvent) {
 				throw new Error("Command Code stream ended before a terminal event");
 			}

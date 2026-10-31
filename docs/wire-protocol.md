@@ -2,9 +2,9 @@
 
 Command Code does not publish an API reference for this endpoint. Everything
 here was reverse-engineered from the `command-code` npm CLI (currently verified
-against v0.52.1) and
+against v1.88.2) and
 confirmed against the live gateway. Treat it as a snapshot that can drift —
-when it breaks, re-derive from the current CLI bundle (`$(npm root -g)/command-code/dist/index.mjs`).
+when it breaks, re-derive from the current CLI bundle (`$(npm root -g)/command-code/dist/cli.mjs`).
 
 ## Why this endpoint (and not `/provider/v1/*`)
 
@@ -43,20 +43,23 @@ The CLI also supports `--local` (`http://localhost:9090`) and `--staging`
 
 ### Other endpoints the extension touches
 
-| Path                         | Purpose                                                                                                                      |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `GET /alpha/whoami`          | `/login commandcode-alpha` validates the pasted key here, mirroring the CLI; a 401 rejects the key, 403/unreachable keeps it |
-| `GET /provider/v1/models`    | live roster discovery at startup (public — answers unauthenticated); no static fallback in `index.ts` when unavailable       |
-| `GET /alpha/billing/credits` | real credit balance (see `docs/caching.md`)                                                                                  |
+| Path                                  | Purpose                                                                                                                                |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /alpha/whoami`                   | `/login commandcode-alpha` validates the pasted key here, mirroring the CLI; a 401 rejects the key, 403/unreachable keeps it           |
+| `GET /provider/v1/models?view=client` | the CLI model catalog discovery reads at startup (public — answers unauthenticated); no static fallback in `index.ts` when unavailable |
+| `GET /alpha/billing/subscriptions`    | the account plan (`data.planId`) plan gating filters against                                                                           |
+| `GET /alpha/billing/credits`          | credit balances; purchased/free credits bypass the plan gate (see also `docs/caching.md`)                                              |
 
-`GET /provider/v1/models?view=client` (the CLI's model catalog) and
-`GET /alpha/lifecycle-events` are **not** used. Neither is a staleness signal:
-the router serves the identical catalog body whatever `x-command-code-version`
-says, and it has no version endpoint (`GET /versions` is 404).
+The plain `GET /provider/v1/models` (no query) answers unauthenticated with a
+minimal OpenAI-style list (`id`, `name`, `context_length`, `supported_endpoints`
+only) — the extension does not use it. `GET /alpha/lifecycle-events` is not
+used either. Neither is a staleness signal: the router serves the identical
+catalog body whatever `x-command-code-version` says, and it has no version
+endpoint (`GET /versions` is 404).
 
 There is, however, a real gateway-side gate — a **floor**, not a ceiling.
 `/alpha/generate` validates `x-command-code-version` and rejects anything below
-its minimum with a 403 whose body carries the floor (verified live 2026-10-31):
+its minimum with a 403 whose body carries the floor (0.18.10 as of 2026-10-31):
 
 ```json
 {
@@ -68,19 +71,14 @@ its minimum with a 403 whose body carries the floor (verified live 2026-10-31):
 }
 ```
 
-`0.18.9`, `0.52`, `abc`, and a missing header all 403; `0.18.10` and above pass
-to body validation (400), as does `v0.52.1` (a leading `v` is tolerated). An
-ahead-of-server version is accepted, so the header is not a "is this client
-new enough for the protocol" check — it is a deprecation floor. `GET
-/alpha/whoami` and `GET /provider/v1/models` ignore it.
+At and above the floor the request proceeds to body validation (400); a
+leading `v` is tolerated, and an ahead-of-server version is accepted, so the
+header is a deprecation floor, not a protocol check. `GET /alpha/whoami` and
+`GET /provider/v1/models` ignore it.
 
-The header value is the npm **package version**, unchanged in 1.88.2: both
-bundles derive it from `getPackageJson(...).version` (`Ps` in 0.52.1,
-`UF`/`HU`/`yJ` over `cliVersion` in 1.88.2), and intercepting the real 1.88.2
-CLI's `fetch` showed `x-command-code-version: 1.88.2` on all five requests it
-made (`/alpha/whoami` ×2, `/alpha/lifecycle-events`, `/alpha/fingerprint/record`,
-`/alpha/generate`). So the extension's pin is directly comparable to the npm
-release — which is what `update.ts` relies on.
+The header value is the npm **package version** — the CLI derives it from its
+own `package.json` — so the extension's pin is directly comparable to the npm
+release, which is what `update.ts` relies on.
 
 The CLI's own notion of "this client is too old for the _protocol_" is purely
 local: its catalog parser maps an unknown `behaviorProfile` onto
@@ -117,7 +115,7 @@ Content-Type: application/json
 Accept: application/x-ndjson
 User-Agent: cli
 x-cli-environment: production
-x-command-code-version: 0.52.1
+x-command-code-version: 1.88.2
 x-session-id: <uuid>
 # Optional when CMD_ZDR=1:
 x-cmd-zdr: 1
@@ -151,7 +149,7 @@ Body:
 	"skills": null,
 	"permissionMode": "standard",
 	"params": {
-		"model": "deepseek/deepseek-v4-pro", // canonical id from /provider/v1/models
+		"model": "deepseek/deepseek-v4-pro", // canonical id from the catalog
 		"system": "…system prompt…", // plain string — see note under the envelope
 		"messages": [
 			/* Vercel AI SDK ModelMessage[] — see below */
@@ -166,6 +164,14 @@ Body:
 	"threadId": "<uuid>" // same value as the x-session-id header
 }
 ```
+
+The CLI also sends top-level `mode` (a use-mode string such as
+`"custom-agent"` for subagent turns) and `promptCache` (`"off"` on its
+internal side-requests); both are optional — the gateway accepts the body
+without them, which is what the extension sends. `params.reasoning_effort` is
+the CLI's per-turn effort selection (snake_case, sent only for thinking models
+with an explicit effort); the extension omits it and the model runs at its
+default effort.
 
 ### The `config` envelope is schema-strict
 
@@ -217,8 +223,9 @@ The three message roles:
   { "type": "image", "image": "data:image/png;base64,…", "mediaType": "image/png" }
 ]}
 
-// assistant (text + tool calls)
+// assistant (reasoning + text + tool calls)
 { "role": "assistant", "content": [
+  { "type": "reasoning", "text": "…" },
   { "type": "text", "text": "…" },
   { "type": "tool-call", "toolCallId": "call_…", "toolName": "read_file", "input": { "path": "x" } }
 ]}
@@ -230,6 +237,12 @@ The three message roles:
 ]}
 ```
 
+- Assistant `reasoning` parts round-trip the thinking from earlier assistant
+  turns. Most reasoning models preserve it server-side, but some (e.g.
+  `reflection/beam:free`) 400 with
+  `Missing required parameter: 'messages[N].reasoning_content'` when an
+  earlier turn's reasoning is not sent back. The CLI sends the parts on every
+  turn, and so does the extension.
 - Tool result `output` is `{ "type": "text", "value": "…" }` (or
   `{ "type": "error-text", "value": "…" }`), **not** a raw string.
 - `toolCallId` / `toolName` (camelCase, hyphen in `tool-call` / `tool-result`),
@@ -292,24 +305,25 @@ Event sequence for a typical tool-using turn:
 
 ### Event reference
 
-| `type`              | Key fields                                  | Maps to harness event     |
-| ------------------- | ------------------------------------------- | ------------------------- |
-| `start`             | —                                           | `start`                   |
-| `start-step`        | `request.body` (echo of upstream request)   | (ignored)                 |
-| `reasoning-start`   | `id`                                        | `thinking_start`          |
-| `reasoning-delta`   | `id`, `text`                                | `thinking_delta`          |
-| `reasoning-end`     | `id`                                        | `thinking_end`            |
-| `text-start`        | `id`                                        | `text_start`              |
-| `text-delta`        | `id`, `text`                                | `text_delta`              |
-| `text-end`          | `id`                                        | `text_end`                |
-| `tool-input-start`  | `id`, `toolName`                            | `toolcall_start`          |
-| `tool-input-delta`  | `id`, `delta` (JSON string chunk)           | `toolcall_delta`          |
-| `tool-input-end`    | `id`                                        | `toolcall_end`            |
-| `tool-call`         | `toolCallId`, `toolName`, `input` (full)    | `toolcall_end` (fallback) |
-| `finish-step`       | `finishReason`, `usage`, `providerMetadata` | accumulates usage/cost    |
-| `finish`            | `finishReason`, `totalUsage`                | finalizes `done`          |
-| `provider-metadata` | `providerMetadata` (routing-specific)       | (consumed for cost)       |
-| `error`             | `error` or `message`                        | `error`                   |
+| `type`               | Key fields                                | Maps to harness event                            |
+| -------------------- | ----------------------------------------- | ------------------------------------------------ |
+| `start`              | —                                         | `start`                                          |
+| `start-step`         | `request.body` (echo of upstream request) | (ignored)                                        |
+| `reasoning-start`    | `id`                                      | `thinking_start`                                 |
+| `reasoning-delta`    | `id`, `text`                              | `thinking_delta`                                 |
+| `reasoning-end`      | `id`                                      | `thinking_end`                                   |
+| `text-start`         | `id`                                      | `text_start`                                     |
+| `text-delta`         | `id`, `text`                              | `text_delta`                                     |
+| `text-end`           | `id`                                      | `text_end`                                       |
+| `tool-input-start`   | `id`, `toolName`                          | `toolcall_start`                                 |
+| `tool-input-delta`   | `id`, `delta` (JSON string chunk)         | `toolcall_delta`                                 |
+| `tool-input-end`     | `id`                                      | `toolcall_end`                                   |
+| `tool-call`          | `toolCallId`, `toolName`, `input` (full)  | `toolcall_end` (fallback)                        |
+| `finish-step`        | `finishReason`, `usage`                   | accumulates usage                                |
+| `finish`             | `finishReason`, `totalUsage`              | finalizes `done`                                 |
+| `cache-write-tokens` | `cacheWriteTokens`                        | patches `cacheWrite` when `finish` reported none |
+| `provider-metadata`  | `providerMetadata` (routing-specific)     | anthropic 1h cache-write split                   |
+| `error`              | `error` or `message`                      | `error`                                          |
 
 **Gotcha:** the per-delta tool events use field **`id`**, but the final
 redundant `tool-call` event uses **`toolCallId`**. If you key everything off
@@ -351,34 +365,30 @@ See `docs/caching.md`.
 
 ### `providerMetadata` (in `finish-step` / terminal `provider-metadata`)
 
-Which keys appear depends on how the gateway routed the call. A call routed
-through **Vercel AI Gateway** carries `gateway` metadata with routing + real
-cost:
+Which keys appear depends on how the gateway routed the call: Vercel AI
+Gateway routing carries `gateway` metadata (routing, `generationId`); a direct
+upstream carries its own key (e.g. `novita` with prediction-token stats). The
+extension reads exactly one key out of `providerMetadata`:
+`anthropic.usage.cache_creation.ephemeral_1h_input_tokens` on a terminal
+`provider-metadata` event — the Anthropic 1-hour cache-write split.
 
-```jsonc
-"providerMetadata": {
-  "deepseek": { "promptCacheHitTokens": 5376, "promptCacheMissTokens": 42 },
-  "gateway": {
-    "routing": { "resolvedProvider": "deepseek", "finalProvider": "deepseek", … },
-    "cost": "0.000065598",            // real USD market cost
-    "inferenceCost": "0.000065598",
-    "generationId": "gen_…"
-  }
-}
+### Cost
+
+The gateway reports usage but no per-request USD. The extension computes cost
+locally from the catalog's `pricing` rates (USD per 1M tokens, carried onto
+each discovered model):
+
+```
+cost = (uncachedInput × input + output × output
+        + cacheRead × cacheRead + cacheWrite × cacheWrite) / 1_000_000
 ```
 
-A call routed to a direct upstream instead carries that upstream's own key —
-e.g. `novita` with only prediction-token stats, and **no cost field**:
-
-```jsonc
-"providerMetadata": {
-  "novita": { "acceptedPredictionTokens": 0, "rejectedPredictionTokens": 0 }
-}
-```
-
-So `gateway.cost` is present only on some routings; the extension reads it
-when it exists and meters $0 when it doesn't. When present, `gateway.cost` is
-the _actual_ upstream USD cost, distinct from what the Go plan debits in
-credits (the plan applies per-model multipliers; see `README.md`). Costs from
-each `finish-step` accumulate, and a cost on the terminal `finish` /
-`provider-metadata` event overrides the accumulated total.
+`uncachedInput` is `inputTokens` minus the cache-read and cache-write tokens
+(the usage buckets are disjoint, see above). `cacheWrite` comes from
+`inputTokenDetails.cacheWriteTokens` on the terminal `usage`, is patched by
+the `cache-write-tokens` event when that reported 0, and the 1-hour split is
+folded in when it exceeds the reported total. The result lands in
+`usage.cost` (per-bucket USD plus `total`, which the session meter reads).
+These are the catalog's market rates; the Go plan's per-model credit
+multipliers are not applied, so the metered number is an upstream-cost
+estimate, not what the account is debited.

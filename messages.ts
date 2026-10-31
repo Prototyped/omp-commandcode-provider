@@ -9,8 +9,15 @@
  *
  * Shape:
  *   user:      { role: "user",      content: [{ type: "text", text }, { type: "image", image, mediaType }] }
- *   assistant: { role: "assistant", content: [{ type: "text", text }, { type: "tool-call", toolCallId, toolName, input }] }
+ *   assistant: { role: "assistant", content: [{ type: "text", text }, { type: "reasoning", text }, { type: "tool-call", toolCallId, toolName, input }] }
  *   tool:      { role: "tool",      content: [{ type: "tool-result", toolCallId, toolName, output: { type: "text", value } }] }
+ *
+ * Assistant thinking blocks ride back as `reasoning` parts, exactly like the
+ * CLI (1.88.2 `toWireMessages` maps `thinking` → `{type:"reasoning"}`). Most
+ * reasoning models preserve earlier reasoning server-side, but some (e.g.
+ * `reflection/beam:free`) 400 with "Missing required parameter:
+ * 'messages[N].reasoning_content'" without it — so the extension always
+ * sends the parts, matching the CLI.
  */
 import type { Message } from "@oh-my-pi/pi-ai";
 
@@ -18,6 +25,7 @@ type UserContent = { type: "text"; text: string } | { type: "image"; image: stri
 
 type AssistantContent =
 	| { type: "text"; text: string }
+	| { type: "reasoning"; text: string }
 	| { type: "tool-call"; toolCallId: string; toolName: string; input: Record<string, unknown> };
 
 type ToolContent = {
@@ -59,6 +67,8 @@ export function convertMessages(messages: Message[]): CmdMessage[] {
 			for (const block of msg.content) {
 				if (block.type === "text") {
 					if (block.text) content.push({ type: "text", text: block.text });
+				} else if (block.type === "thinking") {
+					if (block.thinking) content.push({ type: "reasoning", text: block.thinking });
 				} else if (block.type === "toolCall") {
 					toolNameById.set(block.id, block.name);
 					content.push({
@@ -68,9 +78,6 @@ export function convertMessages(messages: Message[]): CmdMessage[] {
 						input: block.arguments ?? {},
 					});
 				}
-				// Deliberate divergence from the CLI, which round-trips prior
-				// reasoning as {"type":"reasoning"} parts: omitting it keeps the
-				// input small on a provider where reasoning tokens dominate cost.
 			}
 			if (content.length > 0) out.push({ role: "assistant", content });
 		} else if (msg.role === "toolResult") {

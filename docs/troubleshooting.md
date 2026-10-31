@@ -66,19 +66,17 @@ machine-readable floor:
 }
 ```
 
-Verified against the live gateway (2026-10-31): `0.18.9`, `0.52` (two-part),
-`v0.0.1`-style junk, and a missing header all 403; `0.18.10` and above 400 on
-the body schema instead, i.e. they pass the gate. `v0.52.1` passes too (the
-leading `v` is tolerated). The check is a floor only — there is **no upper
-bound**, so an ahead-of-server version is accepted. `GET /alpha/whoami` and
-`GET /provider/v1/models` do not gate on it.
+The check is a floor only (0.18.10 as of 2026-10-31) — there is **no upper
+bound**, so an ahead-of-server version is accepted, and a leading `v` is
+tolerated. `GET /alpha/whoami` and `GET /provider/v1/models` do not gate on
+it.
 
-This is why `COMMAND_CODE_VERSION` matters for something other than
-bookkeeping: the extension reports its pin as the client version, so a pin
-below the floor breaks every turn. When you see this, bump the pin (see the
-next section for re-deriving the protocol). The status-line notice described
-below fires on the _reverse_ condition — a pin that is too **old relative to
-npm**, which also means it is eventually too old for the gateway.
+`COMMAND_CODE_VERSION` matters beyond bookkeeping: the extension reports its
+pin as the client version, so a pin below the floor breaks every turn. When
+you see this, bump the pin (see the next section for re-deriving the
+protocol). The status-line notice described below fires on the _reverse_
+condition — a pin that is too **old relative to npm**, which also means it is
+eventually too old for the gateway.
 
 ## 400 — `BAD_REQUEST` (schema mismatch)
 
@@ -117,6 +115,21 @@ tool results folded in) instead of `tool-call` / `tool-result` /
 `role:"tool"`. See the schema in `docs/wire-protocol.md`. If the gateway
 migrates to a new message schema version, `convertMessages()` is where to fix
 it.
+
+### Missing `reasoning_content` on an assistant turn
+
+```
+{"type":"error","error":{"type":"server_error","message":"Missing required parameter: 'messages[2].reasoning_content'. This model needs the reasoning of every earlier assistant message: send back the 'reasoning_content' returned with that message. …","statusCode":400,"isRetryable":false}}
+```
+
+Some models keep no server-side copy of earlier reasoning and require it in
+the request (confirmed for `reflection/beam:free`; others may behave the
+same). Most reasoning models do preserve the reasoning server-side, so the
+error is model-specific, not universal — but the CLI sends assistant thinking
+back as `{ "type": "reasoning", "text": "…" }` parts on every turn, which the
+gateway maps onto the upstream `reasoning_content` field, and the extension
+matches that. The error surfaces on the _next_ request after a reasoning
+turn, so a first turn can succeed and the second 400.
 
 ### `params.system` sent as an array
 

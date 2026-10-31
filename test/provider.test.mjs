@@ -4,7 +4,12 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import registerCommandCode, { convertMessages, parseModelRows, readExcludedModels } from "../index.ts";
+import registerCommandCode, {
+	convertMessages,
+	evaluateModelAccess,
+	parseCatalog,
+	readExcludedModels,
+} from "../index.ts";
 import { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText, pickLatestStable } from "../update.ts";
 
 let provider;
@@ -104,7 +109,7 @@ test("truncated NDJSON stream fails instead of emitting done", async () => {
 
 test("tool-call accepts the current args fallback", async () => {
 	mockFetch(async (_input, init) => {
-		assert.equal(init.headers["x-command-code-version"], "0.52.1");
+		assert.equal(init.headers["x-command-code-version"], "1.88.2");
 		return ndjsonResponse([
 			'{"type":"start"}',
 			'{"type":"tool-call","toolCallId":"call_1","toolName":"get_weather","args":{"location":"Paris"}}',
@@ -389,77 +394,102 @@ test("rawFinishReason is used when finishReason is absent", async () => {
 	assert.equal(events.at(-1).reason, "toolUse");
 });
 
-// ---- Session cost from gateway metadata ---------------------------------------
+// ---- Session cost from catalog rates -------------------------------------------
+// The gateway reports usage only; providerMetadata.gateway.cost does not exist.
 
-test("session cost comes from providerMetadata.gateway.cost (string)", async () => {
+const catalogPricedModel = {
+	...model,
+	cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
+};
+
+test("cost is computed from the model rates over final usage", async () => {
 	mockFetch(async () =>
 		ndjsonResponse([
 			'{"type":"start"}',
-			'{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":100,"outputTokens":5},"providerMetadata":{"gateway":{"cost":"0.000123"}}}',
+			'{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":762,"outputTokens":1}}',
 		]),
 	);
 
 	const events = await collect(
-		provider.streamSimple(model, { systemPrompt: "", messages: [], tools: [] }, { apiKey: "user_test" }),
+		provider.streamSimple(
+			catalogPricedModel,
+			{ systemPrompt: "", messages: [], tools: [] },
+			{ apiKey: "user_test" },
+		),
 	);
 
 	const done = events.at(-1);
 	assert.equal(done?.type, "done");
-	assert.equal(done.message.usage.input, 100);
-	assert.equal(done.message.usage.output, 5);
-	assert.equal(done.message.usage.cost.total, 0.000123);
+	assert.equal(done.message.usage.input, 762);
+	// 762 * 0.15 / 1e6 + 1 * 0.6 / 1e6
+	expect(done.message.usage.cost.total).toBeCloseTo(762 * 0.15e-6 + 0.6e-6, 15);
 });
 
-test("per-step costs accumulate across finish-step events", async () => {
+test("cache reads price at the cacheRead rate and shrink the billed input", async () => {
 	mockFetch(async () =>
 		ndjsonResponse([
 			'{"type":"start"}',
-			'{"type":"finish-step","finishReason":"tool-calls","usage":{"inputTokens":10,"outputTokens":2},"providerMetadata":{"gateway":{"cost":"0.0001"}}}',
-			'{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":20,"outputTokens":3},"providerMetadata":{"gateway":{"cost":"0.0002"}}}',
-			'{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":30,"outputTokens":5,"totalTokens":35}}',
+			'{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":762,"inputTokenDetails":{"cacheReadTokens":512},"outputTokens":1}}',
 		]),
 	);
 
 	const events = await collect(
-		provider.streamSimple(model, { systemPrompt: "", messages: [], tools: [] }, { apiKey: "user_test" }),
+		provider.streamSimple(
+			catalogPricedModel,
+			{ systemPrompt: "", messages: [], tools: [] },
+			{ apiKey: "user_test" },
+		),
 	);
 
-	assert.equal(events.at(-1)?.type, "done");
-	expect(events.at(-1).message.usage.cost.total).toBeCloseTo(0.0003, 12);
+	const usage = events.at(-1).message.usage;
+	assert.equal(usage.input, 250);
+	assert.equal(usage.cacheRead, 512);
+	// 250 * 0.15 + 1 * 0.6 + 512 * 0.003, per 1M
+	expect(usage.cost.total).toBeCloseTo((250 * 0.15 + 0.6 + 512 * 0.003) / 1e6, 15);
 });
 
-test("terminal finish cost overrides accumulated step costs", async () => {
+test("cache-write-tokens patches usage when finish reported none", async () => {
 	mockFetch(async () =>
 		ndjsonResponse([
 			'{"type":"start"}',
-			'{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":10,"outputTokens":2},"providerMetadata":{"gateway":{"cost":"0.0001"}}}',
-			'{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":10,"outputTokens":2},"providerMetadata":{"gateway":{"cost":"0.0005"}}}',
+			'{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":100,"outputTokens":2}}',
+			'{"type":"cache-write-tokens","cacheWriteTokens":30}',
 		]),
 	);
 
 	const events = await collect(
-		provider.streamSimple(model, { systemPrompt: "", messages: [], tools: [] }, { apiKey: "user_test" }),
+		provider.streamSimple(
+			catalogPricedModel,
+			{ systemPrompt: "", messages: [], tools: [] },
+			{ apiKey: "user_test" },
+		),
 	);
 
-	assert.equal(events.at(-1)?.message?.usage?.cost?.total, 0.0005);
+	const usage = events.at(-1).message.usage;
+	assert.equal(usage.cacheWrite, 30);
+	// (100+2 out) priced + 30 written at cacheWrite rate 0
+	assert.equal(usage.cost.total, (100 * 0.15 + 2 * 0.6) / 1e6);
+});
 
-	// The trailing provider-metadata event is also terminal: its cost overrides
-	// the accumulated step costs instead of adding to them.
+test("provider-metadata supplies the anthropic 1h cache-write split", async () => {
 	mockFetch(async () =>
 		ndjsonResponse([
 			'{"type":"start"}',
-			'{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":10,"outputTokens":2},"providerMetadata":{"gateway":{"cost":"0.0001"}}}',
-			'{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":10,"outputTokens":2}}',
-			'{"type":"provider-metadata","providerMetadata":{"gateway":{"cost":"0.0009"}}}',
+			'{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":100,"inputTokenDetails":{"cacheWriteTokens":40},"outputTokens":2}}',
+			'{"type":"provider-metadata","providerMetadata":{"anthropic":{"usage":{"cache_creation":{"ephemeral_1h_input_tokens":25}}}}}',
 		]),
 	);
 
-	const events2 = await collect(
-		provider.streamSimple(model, { systemPrompt: "", messages: [], tools: [] }, { apiKey: "user_test" }),
+	const events = await collect(
+		provider.streamSimple(
+			catalogPricedModel,
+			{ systemPrompt: "", messages: [], tools: [] },
+			{ apiKey: "user_test" },
+		),
 	);
 
-	assert.equal(events2.at(-1)?.type, "done");
-	assert.equal(events2.at(-1)?.message?.usage?.cost?.total, 0.0009);
+	// 1h (25) is a subset of the reported cacheWrite (40) — nothing added.
+	assert.equal(events.at(-1).message.usage.cacheWrite, 40);
 });
 
 // ---- Stream — usage & terminal events ------------------------------------------
@@ -493,14 +523,14 @@ test("cacheRead falls back to inputTokenDetails then raw prompt_cache_hit_tokens
 	assert.equal(eventsB.at(-1).message.usage.cacheRead, 25);
 });
 
-test("provider-metadata alone is terminal and falls back to inferenceCost", async () => {
+test("provider-metadata without a finish event is not terminal", async () => {
 	const events = await runStream([
 		'{"type":"start"}',
-		'{"type":"provider-metadata","providerMetadata":{"gateway":{"inferenceCost":"0.5"}}}',
+		'{"type":"provider-metadata","providerMetadata":{"novita":{}}}',
 	]);
 
-	assert.equal(events.at(-1).type, "done");
-	assert.equal(events.at(-1).message.usage.cost.total, 0.5);
+	assert.equal(events.at(-1).type, "error");
+	assert.match(events.at(-1).error.errorMessage, /ended before a terminal event/);
 });
 
 // ---- Stream — errors & transport -------------------------------------------------
@@ -511,8 +541,14 @@ test("error events surface the gateway message; a bare error gets a generic one"
 	assert.equal(eventsA.at(-1).reason, "error");
 	assert.match(eventsA.at(-1).error.errorMessage, /upstream exploded/);
 
-	const eventsB = await runStream(['{"type":"start"}', '{"type":"error"}']);
-	assert.equal(eventsB.at(-1).error.errorMessage, "Command Code stream error");
+	const eventsB = await runStream([
+		'{"type":"start"}',
+		'{"type":"error","error":{"type":"server_error","message":"model down","statusCode":400}}',
+	]);
+	assert.match(eventsB.at(-1).error.errorMessage, /server_error: model down/);
+
+	const eventsC = await runStream(['{"type":"start"}', '{"type":"error"}']);
+	assert.equal(eventsC.at(-1).error.errorMessage, "Command Code stream error: Command Code stream error");
 });
 
 test("non-OK responses surface status and body detail", async () => {
@@ -754,152 +790,92 @@ test("login rejects an empty prompt", async () => {
 	await expect(provider.oauth.login({ onPrompt: async () => "   " })).rejects.toThrow(/Login cancelled/);
 });
 
-// ---- Live model discovery + exclusions ------------------------------------------
+// ---- Live model discovery from the gateway catalog -------------------------------
 
-function discoveryFetch({
-	roster = () => Response.json({ data: [] }),
-	modelsDev = () => Response.json({ commandcode: { models: {} } }),
-} = {}) {
+function catalogRow(overrides = {}) {
+	return {
+		id: "deepseek/deepseek-v4-flash",
+		name: "DeepSeek V4 Flash",
+		display: { label: "DeepSeek V4 Flash" },
+		aliases: [],
+		hidden: null,
+		context_length: 1_000_000,
+		maxOutputTokens: null,
+		inputModalities: ["text"],
+		reasoningEfforts: ["off", "low", "high", "max"],
+		behaviorProfile: "standard-v1",
+		zdr: true,
+		category: "opensource",
+		minimumPlan: "individual-go",
+		pricing: { inputCost: 0.15, outputCost: 0.6, cacheReadCost: 0.003 },
+		...overrides,
+	};
+}
+
+function catalogBody(rows) {
+	return Response.json({
+		schemaVersion: 1,
+		catalogVersion: "c1",
+		refreshAfterSeconds: 900,
+		roles: {},
+		data: rows,
+	});
+}
+
+function discoveryFetch({ catalog = () => catalogBody([]) } = {}) {
 	mockFetch(async (url) => {
-		if (url === "https://api.commandcode.ai/provider/v1/models") return roster();
-		if (url === "https://models.dev/api.json") return modelsDev();
+		if (url === "https://api.commandcode.ai/provider/v1/models?view=client") return catalog();
 		throw new Error(`unexpected fetch: ${url}`);
 	});
 }
 
-test("fetchDynamicModels maps the live roster with models.dev capabilities and exclusions", async () => {
-	withAgentDir(`providers:
-  commandcode-alpha:
-    apiKey: user_test
-    excludedModels:
-      - "deepseek/deepseek-v4-pro"
-`);
+test("fetchDynamicModels maps catalog rows to harness models with rates", async () => {
+	withAgentDir();
 	discoveryFetch({
-		roster: () =>
-			Response.json({
-				data: [
-					{ id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context_length: 1_000_000 },
-					{ id: "moonshotai/Kimi-K3", name: "Kimi K3", context_length: 1_000_000 },
-					{ id: "plain-model" },
-				],
-			}),
-		modelsDev: () =>
-			Response.json({
-				commandcode: {
-					models: {
-						"moonshotai/Kimi-K3": { reasoning: true, attachment: true, limit: { output: 65_536 } },
-						"plain-model": { reasoning: false, limit: { output: 4_096 } },
-					},
-				},
-			}),
+		catalog: () =>
+			catalogBody([
+				catalogRow(),
+				catalogRow({
+					id: "moonshotai/Kimi-K3",
+					inputModalities: ["text", "image"],
+					reasoningEfforts: [],
+					maxOutputTokens: 131_072,
+				}),
+			]),
 	});
 
 	const models = await provider.fetchDynamicModels("user_test");
-
 	assert.deepEqual(
 		models.map((m) => m.id),
-		["moonshotai/Kimi-K3", "plain-model"],
+		["deepseek/deepseek-v4-flash", "moonshotai/Kimi-K3"],
 	);
-	const kimi = models[0];
-	assert.equal(kimi.reasoning, true);
+	const flash = models[0];
+	assert.equal(flash.reasoning, true);
+	assert.deepEqual(flash.input, ["text"]);
+	assert.equal(flash.contextWindow, 1_000_000);
+	// null maxOutputTokens clamps to the gateway's hard cap
+	assert.equal(flash.maxTokens, 200_000);
+	assert.deepEqual(flash.cost, { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 });
+	const kimi = models[1];
+	assert.equal(kimi.reasoning, false);
 	assert.deepEqual(kimi.input, ["text", "image"]);
-	assert.equal(kimi.contextWindow, 1_000_000);
-	assert.equal(kimi.maxTokens, 65_536);
-	const plain = models[1];
-	assert.equal(plain.reasoning, false);
-	assert.deepEqual(plain.input, ["text"]);
-	assert.equal(plain.contextWindow, 128_000);
-	assert.equal(plain.maxTokens, 4_096);
+	assert.equal(kimi.maxTokens, 131_072);
 });
 
-test("fetchDynamicModels filters proprietary models out of the live roster", async () => {
-	discoveryFetch({
-		roster: () =>
-			Response.json({
-				data: [
-					{ id: "deepseek/deepseek-v4-pro" },
-					{ id: "claude-opus-4-8" },
-					{ id: "gpt-5.5" },
-					{ id: "google/gemini-3.5-flash" },
-					{ id: "moonshotai/Kimi-K3" },
-				],
-			}),
-	});
-
-	const models = await provider.fetchDynamicModels("user_test");
-	assert.deepEqual(
-		models.map((m) => m.id),
-		["deepseek/deepseek-v4-pro", "moonshotai/Kimi-K3"],
-	);
-});
-
-test("fetchDynamicModels accepts a bare-array roster body", async () => {
-	discoveryFetch({
-		roster: () => Response.json([{ id: "a/b", name: "A/B" }]),
-		modelsDev: () => Response.json({ commandcode: { models: { "a/b": { reasoning: true } } } }),
-	});
-
-	const models = await provider.fetchDynamicModels("user_test");
-	assert.deepEqual(
-		models.map((m) => m.id),
-		["a/b"],
-	);
-	assert.equal(models[0].reasoning, true);
-});
-
-test("fetchDynamicModels returns no models when the roster endpoint fails", async () => {
-	discoveryFetch({
-		roster: () => new Response("{}", { status: 500 }),
-	});
-
-	assert.deepEqual(await provider.fetchDynamicModels("user_test"), []);
-});
-
-test("fetchDynamicModels returns no models on an unrecognized roster body", async () => {
-	discoveryFetch({
-		roster: () => Response.json({ unexpected: true }),
-	});
-
-	assert.deepEqual(await provider.fetchDynamicModels("user_test"), []);
-});
-
-test("fetchDynamicModels assumes reasoning for models models.dev does not know", async () => {
-	discoveryFetch({
-		roster: () => Response.json({ data: [{ id: "brand/new-model", name: "Brand New" }] }),
-	});
-
-	const models = await provider.fetchDynamicModels("user_test");
-	assert.equal(models.length, 1);
-	assert.equal(models[0].reasoning, true);
-	assert.deepEqual(models[0].input, ["text"]);
-	assert.equal(models[0].contextWindow, 128_000);
-	assert.equal(models[0].maxTokens, 8192);
-});
-
-test("fetchDynamicModels still maps the roster when models.dev is unreachable", async () => {
-	discoveryFetch({
-		roster: () => Response.json({ data: [{ id: "a/b", context_length: 200_000 }] }),
-		modelsDev: () => {
-			throw new Error("network down");
-		},
-	});
-
-	const models = await provider.fetchDynamicModels("user_test");
-	assert.equal(models.length, 1);
-	assert.equal(models[0].id, "a/b");
-	assert.equal(models[0].reasoning, true);
-	assert.equal(models[0].contextWindow, 200_000);
-});
-
-test("exclusions filter the live roster", async () => {
+test("fetchDynamicModels drops hidden rows and honors excludedModels", async () => {
 	withAgentDir(`providers:
   commandcode-alpha:
     apiKey: user_test
     excludedModels:
-      - "deepseek/deepseek-v4-pro"
+      - "deepseek/deepseek-v4-flash"
 `);
 	discoveryFetch({
-		roster: () => Response.json({ data: [{ id: "deepseek/deepseek-v4-pro" }, { id: "moonshotai/Kimi-K3" }] }),
+		catalog: () =>
+			catalogBody([
+				catalogRow(),
+				catalogRow({ id: "secret/model", hidden: true }),
+				catalogRow({ id: "moonshotai/Kimi-K3" }),
+			]),
 	});
 
 	const models = await provider.fetchDynamicModels("user_test");
@@ -909,7 +885,156 @@ test("exclusions filter the live roster", async () => {
 	);
 });
 
+test("fetchDynamicModels returns no models when the catalog endpoint fails", async () => {
+	withAgentDir();
+	discoveryFetch({ catalog: () => new Response("{}", { status: 500 }) });
+	assert.deepEqual(await provider.fetchDynamicModels("user_test"), []);
+});
+
+test("fetchDynamicModels returns no models on an unsupported schema version", async () => {
+	withAgentDir();
+	discoveryFetch({
+		catalog: () =>
+			Response.json({ schemaVersion: 2, catalogVersion: "x", refreshAfterSeconds: 1, data: [catalogRow()] }),
+	});
+	assert.deepEqual(await provider.fetchDynamicModels("user_test"), []);
+});
+
+test("fetchDynamicModels drops malformed rows but keeps good ones", async () => {
+	withAgentDir();
+	discoveryFetch({
+		catalog: () =>
+			catalogBody([
+				{ id: "bad/row" },
+				catalogRow({ context_length: -5 }),
+				catalogRow({ id: "moonshotai/Kimi-K3" }),
+			]),
+	});
+	const models = await provider.fetchDynamicModels("user_test");
+	assert.deepEqual(
+		models.map((m) => m.id),
+		["moonshotai/Kimi-K3"],
+	);
+});
+
+// ---- Plan gating -------------------------------------------------------------------
+
+test("evaluateModelAccess ports the CLI rank rule", async () => {
+	const go = { planId: "individual-go-v1", purchasedCredits: 0, freeCredits: 0, fetchFailed: false };
+	assert.equal(
+		evaluateModelAccess(go, { minimumPlan: "individual-go", category: "opensource" }).allowed,
+		true,
+	);
+	assert.equal(
+		evaluateModelAccess(go, { minimumPlan: "individual-goat", category: "opensource" }).allowed,
+		false,
+	);
+	// an absent minimumPlan falls back to the category gate
+	assert.equal(evaluateModelAccess(go, { category: "opensource" }).allowed, true);
+	// premium is out of reach for Go even without a minimumPlan
+	assert.equal(evaluateModelAccess(go, { category: "premium" }).allowed, false);
+	// an explicit null minimumPlan is the CLI's top-tier-only gate
+	assert.equal(evaluateModelAccess(go, { minimumPlan: null, category: "opensource" }).allowed, false);
+	// unknown categories fail open, like the CLI's knownCategory
+	assert.equal(
+		evaluateModelAccess(go, { minimumPlan: "individual-max", category: "experimental" }).allowed,
+		true,
+	);
+	const goat = { planId: "individual-goat", purchasedCredits: 0, freeCredits: 0, fetchFailed: false };
+	assert.equal(
+		evaluateModelAccess(goat, { minimumPlan: "individual-go", category: "opensource" }).allowed,
+		true,
+	);
+	assert.equal(evaluateModelAccess(goat, { category: "premium" }).allowed, false);
+});
+
+test("credits bypass the plan and billing failure fails open", async () => {
+	const withCredits = {
+		planId: "individual-go-v1",
+		purchasedCredits: 1.5,
+		freeCredits: 0,
+		fetchFailed: false,
+	};
+	assert.equal(
+		evaluateModelAccess(withCredits, { minimumPlan: "individual-max", category: "premium" }).allowed,
+		true,
+	);
+	const failed = { planId: null, purchasedCredits: 0, freeCredits: 0, fetchFailed: true };
+	assert.equal(
+		evaluateModelAccess(failed, { minimumPlan: "individual-max", category: "premium" }).allowed,
+		true,
+	);
+});
+
+test("fetchDynamicModels filters models above the account plan", async () => {
+	withAgentDir();
+	discoveryFetch({
+		catalog: () =>
+			catalogBody([
+				catalogRow(),
+				catalogRow({ id: "meta/muse-spark-1.3", minimumPlan: "individual-goat" }),
+				catalogRow({ id: "claude-opus-5", category: "premium", minimumPlan: "individual-provider" }),
+			]),
+	});
+	// billing endpoints answer the Go plan
+	mockFetch(async (url) => {
+		if (url === "https://api.commandcode.ai/provider/v1/models?view=client") {
+			return catalogBody([
+				catalogRow(),
+				catalogRow({ id: "meta/muse-spark-1.3", minimumPlan: "individual-goat" }),
+				catalogRow({ id: "claude-opus-5", category: "premium", minimumPlan: "individual-provider" }),
+			]);
+		}
+		if (url === "https://api.commandcode.ai/alpha/billing/subscriptions") {
+			return Response.json({ success: true, data: { planId: "individual-go-v1", status: "active" } });
+		}
+		if (url === "https://api.commandcode.ai/alpha/billing/credits") {
+			return Response.json({ credits: { monthlyCredits: 8.7, purchasedCredits: 0, freeCredits: 0 } });
+		}
+		throw new Error(`unexpected fetch: ${url}`);
+	});
+
+	const models = await provider.fetchDynamicModels("user_test");
+	assert.deepEqual(
+		models.map((m) => m.id),
+		["deepseek/deepseek-v4-flash"],
+	);
+});
+
 // ---- Pure helpers ------------------------------------------------------------------
+
+test("convertMessages round-trips assistant thinking as reasoning parts", () => {
+	const out = convertMessages([
+		{ role: "user", content: "work it out" },
+		{
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "step one" },
+				{ type: "text", text: "42" },
+			],
+		},
+		{ role: "user", content: "and more" },
+	]);
+	assert.deepEqual(out[1], {
+		role: "assistant",
+		content: [
+			{ type: "reasoning", text: "step one" },
+			{ type: "text", text: "42" },
+		],
+	});
+	// empty thinking is dropped, like the CLI's `if (e.thinking)` guard
+	const empty = convertMessages([
+		{ role: "user", content: "x" },
+		{
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "" },
+				{ type: "text", text: "42" },
+			],
+		},
+	]);
+	assert.deepEqual(empty[1].content, [{ type: "text", text: "42" }]);
+});
 
 test("convertMessages moves tool-result image blocks into their own user message", () => {
 	const out = convertMessages([
@@ -983,9 +1108,11 @@ test("convertMessages maps a full conversation: strings, images, tool calls, err
 		{ type: "text", text: "look" },
 		{ type: "image", image: "data:image/png;base64,B0C0=", mediaType: "image/png" },
 	]);
-	// Prior reasoning is omitted (documented divergence from the CLI); the
-	// toolName comes from the assistant's tool call, not the tool result.
+	// Prior reasoning rides back as a reasoning part (the CLI does the same;
+	// the gateway 400s stateful reasoning models without it); the toolName
+	// comes from the assistant's tool call, not the tool result.
 	assert.deepEqual(out[2].content, [
+		{ type: "reasoning", text: "hmm" },
 		{ type: "text", text: "let me" },
 		{ type: "tool-call", toolCallId: "tc1", toolName: "a", input: { x: 1 } },
 		{ type: "tool-call", toolCallId: "tc2", toolName: "b", input: { y: 2 } },
@@ -997,15 +1124,38 @@ test("convertMessages maps a full conversation: strings, images, tool calls, err
 	]);
 });
 
-test("parseModelRows handles both shapes", () => {
-	assert.deepEqual(parseModelRows({ data: [{ id: "x/y" }, { noId: true }] }), [
-		{ id: "x/y" },
-		{ noId: true },
-	]);
-	assert.deepEqual(parseModelRows([{ id: "x/y", name: "X" }]), [{ id: "x/y", name: "X" }]);
-	assert.equal(parseModelRows("nope"), null);
-	assert.equal(parseModelRows({ data: "nope" }), null);
-	assert.equal(parseModelRows({}), null);
+test("parseCatalog rejects unsupported schema versions and bad rows", () => {
+	assert.deepEqual(
+		parseCatalog({
+			schemaVersion: 1,
+			catalogVersion: "abc",
+			refreshAfterSeconds: 900,
+			data: [
+				{
+					id: "x/y",
+					context_length: 1_000_000,
+					behaviorProfile: "standard-v1",
+					zdr: true,
+					category: "opensource",
+				},
+				{ id: "bad/row" },
+				{
+					id: "x/y",
+					context_length: 1_000_000,
+					behaviorProfile: "standard-v1",
+					zdr: true,
+					category: "opensource",
+				},
+			],
+		}).map((m) => m.id),
+		["x/y"],
+	);
+	assert.deepEqual(
+		parseCatalog({ schemaVersion: 2, catalogVersion: "x", refreshAfterSeconds: 1, data: [] }),
+		[],
+	);
+	assert.deepEqual(parseCatalog("nope"), []);
+	assert.deepEqual(parseCatalog({}), []);
 });
 
 test("readExcludedModels tolerates missing files and bad yaml", async () => {
@@ -1083,7 +1233,7 @@ test("session_start paints the status line only when the pin is stale", async ()
 		for (let i = 0; i < 10; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 	};
 
-	mockFetch(async () => distTags({ latest: "1.88.2" }));
+	mockFetch(async () => distTags({ latest: "1.89.0" }));
 	// Returns synchronously: the harness awaits session_start handlers, so an
 	// awaited npm round-trip would delay every session start.
 	assert.equal(handlers.get("session_start")({}, ctx), undefined);
@@ -1091,10 +1241,10 @@ test("session_start paints the status line only when the pin is stale", async ()
 	assert.equal(statuses.length, 1);
 	const [key, text] = statuses[0];
 	assert.equal(key, CLI_UPDATE_STATUS_KEY);
-	assert.match(text, /1\.88\.2/);
+	assert.match(text, /1\.89\.0/);
 
 	statuses.length = 0;
-	mockFetch(async () => distTags({ latest: "0.52.1" }));
+	mockFetch(async () => distTags({ latest: "1.88.1" }));
 	await handlers.get("session_start")({}, ctx);
 	await settle();
 	assert.deepEqual(statuses, []);

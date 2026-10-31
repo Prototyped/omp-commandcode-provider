@@ -75,7 +75,8 @@ NONCE=$(uuidgen)
 # is what they produced.)
 ```
 
-Real credit balance (separate from `gateway.cost`):
+Real credit balance (the session meter's `usage.cost` is a local estimate
+from the catalog's `pricing` rates, not what the account is debited):
 
 ```bash
 curl -sS https://api.commandcode.ai/alpha/billing/credits \

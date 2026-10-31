@@ -1,31 +1,38 @@
 /**
  * Command Code provider extension for omp.
  *
- * Routes requests through https://api.commandcode.ai/alpha/generate
- * (the CLI's own endpoint), which every plan permits. The /provider/v1/*
- * OpenAI/Anthropic-compatible endpoints have been flaky/plan-gated for
- * generation, so we stick to the native /alpha/generate envelope the CLI
- * itself uses (GET /provider/v1/models is readable for the roster).
+ * Routes requests through https://api.commandcode.ai/alpha/generate — the
+ * endpoint the `cmd` CLI itself uses, which every plan permits. The
+ * /provider/v1/* OpenAI/Anthropic-compatible endpoints are Pro-gated and are
+ * NOT used; omp's own bundled `commandcode` provider points there, which is
+ * why this extension registers under a distinct id.
  *
- * Authentication: `/login commandcode` (validates the key against
+ * Provider id: commandcode-alpha. Models, capabilities, pricing and plan
+ * gates come from the gateway's CLI catalog
+ * (`GET /provider/v1/models?view=client`) — the same source the CLI uses.
+ *
+ * Authentication: `/login commandcode-alpha` (validates the key against
  * /alpha/whoami, like the CLI does), or a `models.yml` `apiKey` for the
  * provider, or the COMMANDCODE_API_KEY env var as a last-resort fallback.
  * Keys are "user_..." tokens from https://commandcode.ai/settings.
  *
- * Wire contract (envelope, NDJSON events, usage/cost mapping):
- * docs/wire-protocol.md. Modules: messages.ts (harness Message→ModelMessage
- * conversion), session.ts (per-conversation identity), discovery.ts (live
- * roster + capabilities), stream.ts (the /alpha/generate stream).
+ * Wire contract (envelope, NDJSON events, usage mapping): docs/wire-protocol.md.
+ * Modules: messages.ts (harness Message→ModelMessage conversion), session.ts
+ * (per-conversation identity), catalog.ts (catalog parser), discovery.ts
+ * (catalog → harness models), plan.ts (plan gating), stream.ts (the stream).
  */
 import type { OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { BASE_URL, COMMAND_CODE_VERSION, PROVIDER_ID } from "./constants.ts";
 import { discoverModels } from "./discovery.ts";
+import { evaluateModelAccess, fetchBilling } from "./plan.ts";
 import { streamCommandCode } from "./stream.ts";
 import { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText } from "./update.ts";
 
-export { parseModelRows, readExcludedModels } from "./discovery.ts";
+export { parseCatalog } from "./catalog.ts";
+export { readExcludedModels } from "./exclusions.ts";
 export { convertMessages } from "./messages.ts";
+export { evaluateModelAccess } from "./plan.ts";
 export { CLI_UPDATE_STATUS_KEY, checkCliUpdate, cliUpdateStatusText, pickLatestStable } from "./update.ts";
 
 // Mirrors the Command Code CLI's API-key login: only an explicit 401
@@ -66,7 +73,19 @@ export default function (pi: ExtensionAPI) {
 			// credential and feeds it to streamSimple / fetchDynamicModels.
 			login,
 		},
-		fetchDynamicModels: async (apiKey) => discoverModels(apiKey, pi.pi.getAgentDir()),
+		fetchDynamicModels: async (apiKey) => {
+			const [models, billing] = await Promise.all([
+				discoverModels(pi.pi.getAgentDir()),
+				apiKey ? fetchBilling(apiKey, BASE_URL) : Promise.resolve(null),
+			]);
+			if (!billing || billing.fetchFailed) return models;
+			const kept = models.filter((m) => evaluateModelAccess(billing, m).allowed);
+			const dropped = models.length - kept.length;
+			if (dropped > 0) {
+				console.error(`[commandcode-alpha] dropped ${dropped} model(s) above plan ${billing.planId}`);
+			}
+			return kept;
+		},
 	});
 
 	// The pinned CLI version is this extension's protocol contract, so a newer
