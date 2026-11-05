@@ -15,7 +15,7 @@ export const ENDPOINT = "/alpha/generate";
 // Mirrors the `x-command-code-version` the CLI sends (its package version).
 // Keep in step with the `command-code` npm release whose wire protocol this
 // implementation matches — it is a protocol-version marker, not a dependency.
-export const COMMAND_CODE_VERSION = "1.88.2";
+export const COMMAND_CODE_VERSION = "1.88.3";
 // The gateway rejects params.max_tokens above this with 400 "Too big:
 // expected number to be <=200000" (verified 2026-10-31 for deepseek, glm and
 // kimi models alike) — the CLI never sends more (its default is 64e3).

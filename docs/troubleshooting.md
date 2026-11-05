@@ -90,7 +90,7 @@ That is the cue to re-derive the protocol from the new bundle (see
 the check is advisory and never blocks startup.
 
 The check is the CLI's own updater, not an api.commandcode.ai call (`update.ts`
-mirrors the 1.88.2 bundle's `fetchVersions`/`getLatestVersion`/
+mirrors the 1.88.3 bundle's `fetchVersions`/`getLatestVersion`/
 `determineUpdateTarget`: `npm view command-code versions --json`, drop
 prereleases, semver max). `update.ts` asks npm's dist-tags document instead of
 the full packument (~90 bytes versus ~1.2 MB) and applies the same prerelease
@@ -101,7 +101,7 @@ handlers), fetches nothing from the gateway, and works before login.
 A second notice does not depend on npm: when the fetched catalog contains a
 model with a `behaviorProfile` outside the pinned CLI's known set (the set is
 listed in `AGENTS.md`'s validation map — the CLI's own "this client is too old"
-verdict, 1.88.2 `clientUpdateReason`), `index.ts` records the offending
+verdict, 1.88.3 `clientUpdateReason`), `index.ts` records the offending
 profiles at discovery and, at the next `session_start`, sets the status-line
 entry `commandcode-profile` to `Command Code: unknown behaviorProfile
 (<profiles>) — the pinned CLI <version> may be too old`. It fires even when the

@@ -462,7 +462,7 @@ function applyUsage(usage: AssistantMessage["usage"], raw: GatewayUsage): void {
 }
 
 // The stream reports usage, not USD, so cost is the catalog's `pricing`
-// rates — the same math 1.88.2 performs (`estimateCatalogCostUsd`).
+// rates — the same math 1.88.3 performs (`estimateCatalogCostUsd`).
 // Verified live: deepseek/deepseek-v4-flash (inputCost 0.15, outputCost 0.6,
 // cacheReadCost 0.003) prices a cold 762-in/1-out call at $1.149e-4, and
 // $3.964e-5 with 512 cache-read tokens.

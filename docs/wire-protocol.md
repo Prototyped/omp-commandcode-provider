@@ -2,7 +2,7 @@
 
 Command Code does not publish an API reference for this endpoint. Everything
 here was reverse-engineered from the `command-code` npm CLI (currently verified
-against v1.88.2) and
+against v1.88.3) and
 confirmed against the live gateway. Treat it as a snapshot that can drift —
 when it breaks, re-derive from the current CLI bundle (`$(npm root -g)/command-code/dist/cli.mjs`).
 
@@ -70,12 +70,12 @@ signal: the router serves the identical catalog body whatever
 (`GET /versions` is 404).
 
 The `?view=client` document carries a `catalogVersion` (a content hash, e.g.
-`f3a51355…` as of 2026-10-31), and the gateway honors conditional GET on it:
+`44c46d98…` as of 2026-11-05), and the gateway honors conditional GET on it:
 a request with `if-none-match: "<catalogVersion>"` gets a bare `304` when the
 document is unchanged, which is how the CLI revalidates its catalog
-(live-verified 2026-10-31).
+(live-verified 2026-11-05).
 
-Catalog rows may carry `hidden: true` (12 such rows as of 2026-10-31); hidden
+Catalog rows may carry `hidden: true` (14 such rows as of 2026-11-05); hidden
 rows are otherwise complete — same capabilities, pricing, plan gates.
 Divergence (extension): a model selected through `models.yml` carries only
 the id the user wrote, so the extension looks that id up in the fetched
@@ -122,7 +122,7 @@ Content-Type: application/json
 Accept: application/x-ndjson
 User-Agent: cli
 x-cli-environment: production
-x-command-code-version: 1.88.2
+x-command-code-version: 1.88.3
 x-session-id: <uuid>
 # Optional when CMD_ZDR=1:
 x-cmd-zdr: 1
@@ -182,7 +182,7 @@ without them, which is what the extension sends.
 `params.reasoning_effort` (snake_case) is the per-turn effort selection. The
 CLI sends the user's pick verbatim and only picks it from the catalog's
 `reasoningEfforts` filtered through its own effort vocabulary
-(`off | low | medium | high | xhigh | max` — 1.88.2 `Vr` set), so the CLI
+(`off | low | medium | high | xhigh | max` — 1.88.3 `Vr` set), so the CLI
 never sends an unlisted value. The gateway, however, _does_ accept unlisted
 values — and silently disables reasoning when it gets one (measured
 2026-10-31). Divergence (extension): the harness's effort scale also has

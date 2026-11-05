@@ -110,7 +110,7 @@ test("truncated NDJSON stream fails instead of emitting done", async () => {
 
 test("tool-call accepts the current args fallback", async () => {
 	mockFetch(async (_input, init) => {
-		assert.equal(init.headers["x-command-code-version"], "1.88.2");
+		assert.equal(init.headers["x-command-code-version"], COMMAND_CODE_VERSION);
 		return ndjsonResponse([
 			'{"type":"start"}',
 			'{"type":"tool-call","toolCallId":"call_1","toolName":"get_weather","args":{"location":"Paris"}}',

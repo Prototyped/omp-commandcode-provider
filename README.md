@@ -4,7 +4,7 @@ An extension for the [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) cod
 
 > **Fork.** This is a hard fork of [safzanpirani/pi-commandcode-provider](https://github.com/safzanpirani/pi-commandcode-provider), retargeted from the original pi harness to the [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) harness.
 
-> **Unofficial.** Reverse-engineered from the `command-code` npm CLI (currently verified against v1.88.2). Not affiliated with or endorsed by Command Code / Langbase. Schema is undocumented and can change without notice.
+> **Unofficial.** Reverse-engineered from the `command-code` npm CLI (currently verified against v1.88.3). Not affiliated with or endorsed by Command Code / Langbase. Schema is undocumented and can change without notice.
 
 ## Why this exists
 
