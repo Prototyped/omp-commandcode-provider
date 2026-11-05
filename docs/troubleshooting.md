@@ -242,13 +242,14 @@ curl -sS https://api.commandcode.ai/provider/v1/models \
 The stream's `error` event carries `{type, message, statusCode, isRetryable}`.
 Each code means a different user action:
 
-| `type` / code                         | Cause                                                                           | Action                                                                                                                                        |
-| ------------------------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MODEL_NOT_IN_PLAN`                   | Model above the account's plan                                                  | Pick a model the plan includes; the extension drops these at discovery, so this usually means a stale picker cache — run `omp models refresh` |
-| `RATE_LIMITED`                        | Free-tier quota exhausted (e.g. `inclusionai/ling-3.1-flash-1019:free`)         | Switch to the paid id, or wait for the quota reset                                                                                            |
-| `CMD_ZDR_NO_PROVIDERS`                | A `zdr: false` model (e.g. `meta/muse-spark-1.3-contributor`) under `CMD_ZDR=1` | Unset `CMD_ZDR` or pick a ZDR-capable model                                                                                                   |
-| `Model '…' not found`                 | Dead id (e.g. `poolside/laguna-s-2.1-free`) or a gateway-side rewrite           | Remove from `models.yml`; `omp models refresh`                                                                                                |
-| (truncated stream, no terminal event) | Network drop or gateway crash mid-stream                                        | Retry; the harness owns retry/fallback                                                                                                        |
+| `type` / code                         | Cause                                                                                       | Action                                                                                                                                        |
+| ------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MODEL_NOT_IN_PLAN`                   | Model above the account's plan                                                              | Pick a model the plan includes; the extension drops these at discovery, so this usually means a stale picker cache — run `omp models refresh` |
+| `RATE_LIMITED`                        | Free-tier daily quota exhausted                                                             | Switch to the paid id, or wait for the quota reset                                                                                            |
+| `FORBIDDEN`                           | A free-tier window ended (e.g. `poolside/laguna-s-2.1-free`, `ornith/ornith-1.5-122b:free`) | Pick the paid id the message names, or another model                                                                                          |
+| `CMD_ZDR_NO_PROVIDERS`                | A `zdr: false` model (e.g. `meta/muse-spark-1.3-contributor`) under `CMD_ZDR=1`             | Unset `CMD_ZDR` or pick a ZDR-capable model                                                                                                   |
+| `Model '…' not found`                 | Dead id or a gateway-side rewrite                                                           | Remove from `models.yml`; `omp models refresh`                                                                                                |
+| (truncated stream, no terminal event) | Network drop or gateway crash mid-stream                                                    | Retry; the harness owns retry/fallback                                                                                                        |
 
 ## Hidden models
 
@@ -256,5 +257,8 @@ Rows with `hidden: true` in the catalog are filtered out of discovery (they do
 not appear in the picker). They are still parsed with full capability data, so
 a user who manually adds a hidden id to `models.yml` (with an `apiKey` or
 `auth: none` beside it) gets real capabilities instead of defaults. Hidden
-models that are also dead upstream (`poolside/laguna-s-2.1-free`) are a
-gateway-side condition — nothing the extension can prevent.
+models that are also dead upstream are a gateway-side condition — nothing the
+extension can prevent. An expired promo answers 403 `FORBIDDEN` naming the
+ended tier and its paid replacement (`poolside/laguna-s-2.1-free`,
+`ornith/ornith-1.5-122b:free`, `inclusionai/ling-3.1-flash-1019:free`,
+live-checked 2026-11-05).
