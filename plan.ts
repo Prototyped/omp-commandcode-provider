@@ -1,5 +1,5 @@
 /**
- * Plan access, ported from the CLI's `evaluateModelAccess` (1.88.3 bundle).
+ * Plan access, ported from the CLI's `evaluateModelAccess` (1.88.5 bundle).
  *
  * The gateway 403s (`MODEL_NOT_IN_PLAN`) any model above the account's plan;
  * the CLI never offers those in the first place. It fetches
@@ -85,7 +85,7 @@ function rankedAccess(planId: string, minimumPlan: string): AccessResult | undef
 }
 
 /**
- * Faithful port of the CLI's `evaluateModelAccess` (1.88.3 bundle): credits
+ * Faithful port of the CLI's `evaluateModelAccess` (1.88.5 bundle): credits
  * bypass everything; absent/unknown plan or category fails open; an absent
  * `minimumPlan` falls back to the category gate; an explicit `null` is the
  * CLI's top-tier-only gate; a known `minimumPlan` ranks against the account

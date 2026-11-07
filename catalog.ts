@@ -4,7 +4,7 @@
  * `parseModelCatalog`: unknown `schemaVersion` → no models; per-row validation
  * failures drop that row, not the document.
  *
- * Row schema per `parseModel` in the 1.88.3 bundle: id, name, display,
+ * Row schema per `parseModel` in the 1.88.5 bundle: id, name, display,
  * aliases, hidden, context_length (required positive int), maxOutputTokens
  * (positive int or null), inputModalities (string[] or null),
  * reasoningEfforts (string[] or null), behaviorProfile (required string), zdr

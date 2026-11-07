@@ -13,7 +13,7 @@
  *   tool:      { role: "tool",      content: [{ type: "tool-result", toolCallId, toolName, output: { type: "text", value } }] }
  *
  * Assistant thinking blocks ride back as `reasoning` parts, exactly like the
- * CLI (1.88.3 `toWireMessages` maps `thinking` → `{type:"reasoning"}`). Most
+ * CLI (1.88.5 `toWireMessages` maps `thinking` → `{type:"reasoning"}`). Most
  * reasoning models preserve earlier reasoning server-side, but some (e.g.
  * `reflection/beam:free`) 400 with "Missing required parameter:
  * 'messages[N].reasoning_content'" without it — so the extension always

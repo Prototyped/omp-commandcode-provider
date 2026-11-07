@@ -2,7 +2,7 @@
  * Detects a stale `COMMAND_CODE_VERSION` pin.
  *
  * The Command Code CLI's own updater (`fetchVersions` / `getLatestVersion` /
- * `determineUpdateTarget` in the 1.88.3 bundle) asks npm for the package's
+ * `determineUpdateTarget` in the 1.88.5 bundle) asks npm for the package's
  * published versions (`npm view command-code versions --json`), drops
  * prereleases, and compares the semver maximum against its own version.
  *
