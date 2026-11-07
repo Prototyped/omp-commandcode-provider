@@ -126,6 +126,20 @@ bun test
 
 The omp harness runs on bun, so that's the toolchain here too. omp loads `.ts` files directly, so there's no build step.
 
+### Keeping up with the CLI
+
+The extension speaks the wire protocol of a specific `command-code` release (`COMMAND_CODE_VERSION` in `constants.ts`). Two scripts keep that pin honest:
+
+```bash
+bun run wire-diff                     # pinned release -> npm latest: changelog, wire constant sets,
+                                      # anchored parser functions, and a token diff that normalizes
+                                      # minifier renames away; exit 1 means wire changes to inspect
+bun run live-smoke                    # live gateway: whoami, catalog parse, conditional GET, a minimal
+                                      # generate turn with the pin's version header, usage report
+```
+
+`live-smoke` needs a key: `CC_KEY=$(omp token commandcode-alpha) bun run live-smoke`. The full procedure (interpreting the diff, the validation map, the manual tool-call/vision checks) is in `AGENTS.md`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

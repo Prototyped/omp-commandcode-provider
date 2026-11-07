@@ -30,7 +30,11 @@ bun install       # install deps (bun.lock)
 bun run check     # typecheck (tsrs --noEmit)
 bun run lint      # biome check
 bun test          # unit tests (bun:test, mocked fetch)
+bun run wire-diff # compare the pinned CLI release with npm latest (scripts/wire-diff.ts)
+bun run live-smoke # live gateway checks; needs CC_KEY (see below)
 ```
+
+Bundles fetched by `wire-diff` are cached under `.cache/command-code/<version>/` (gitignored).
 
 No build step: omp loads `index.ts` directly; its local relative imports resolve through bun (the loader tags the whole extension module graph with a cache-buster).
 
@@ -39,20 +43,50 @@ No build step: omp loads `index.ts` directly; its local relative imports resolve
 - Tests live in `test/provider.test.mjs` (bun:test). Outbound HTTP is mocked by swapping `globalThis.fetch`; NDJSON responses are built with the `ndjsonResponse` helper.
 - Before implementing a change, build the minimal test matrix from the existing suite (don't duplicate covered cases; extend existing tests over near-identical new ones). Make new tests fail first, then implement.
 - Tests must exercise observable behavior (stream events, usage/cost math, discovery mapping, converted message shapes) — not stub echoes or source text.
+- Tooling tests live in `test/wire-diff.test.mjs`: the bundle tokenizer (strings, templates, regex-vs-division, comments, identifier normalization) and the token diff/hunk grouping.
 - When the wire protocol changes, verify against the **live gateway** (key: `omp token commandcode-alpha` — use it as a bash substitution, never print it; or run the harness directly: `omp --model commandcode-alpha/<model> -p "…"` — the extension is installed as a linked plugin (`omp install .`); add `-e .` only when developing without installing). Set the thinking level with `--thinking <level>`, not a `:level` suffix on `--model` (the CLI suffix form does not resolve for this provider in omp 18.14.1; the config `modelRoles` parser is a different code path — do not assume the two parse identically). Model ids containing a colon (e.g. `reflection/beam:free`) cannot be referenced via `--model` at all — select them with `/model` in the TUI. A live smoke test is part of "done" for any protocol change, not just the unit suite.
 
-## Updating to a new Command Code CLI revision
+## Keeping the extension in step with the CLI
 
-When a new `command-code` CLI release lands (or an undocumented 400/drift appears), re-derive the protocol from the new bundle and update the extension. The pin `COMMAND_CODE_VERSION` is bumped to the new CLI version **as part of this work** — it marks the protocol this code implements.
+`COMMAND_CODE_VERSION` pins the CLI release whose wire protocol this implementation matches. When a new `command-code` release lands (or a live 400/drift appears), determine whether the wire changed, apply changes if it did, and always bump the pin.
 
-### Getting the bundle
+### 1. Diff the bundles
+
+```bash
+bun run wire-diff                       # pinned version -> npm latest
+bun run wire-diff --old 1.88.3 --new 1.88.7
+bun run wire-diff --new <version> --max-hunks 40
+```
+
+`scripts/wire-diff.ts` downloads both tarballs (registry, cached), prints each release's CHANGELOG, then compares the two `dist/cli.mjs` bundles:
+
+- **Wire constant sets** — endpoint paths, `x-*` headers, NDJSON event types, behavior profiles, effort vocabulary, catalog `schemaVersion`, plan ids, message part types, envelope keys, `config` fields, usage fields, `providerMetadata` keys.
+- **Anchored functions** — `parseModel` and `evaluateModelAccess`, byte-compared.
+- **Call-site object keys** — the `/alpha/generate` body, the catalog document, and the reasoning-effort handling.
+- **Semantic diff** — tokenizes both bundles with `scripts/lib/tokenize.ts` and normalizes every identifier to `#` while preserving literals, so minifier renames vanish; it then prints the remaining hunks (`scripts/lib/diff.ts`).
+
+Exit codes: `0` no wire-relevant changes, `1` wire-relevant changes (or wire-suspect hunks), `2` tool error. Hunks are tagged `WIRE-SUSPECT` when they contain known wire strings. Treat the verdict as a filter, not an oracle: identifier normalization hides renamed object keys outside the call-site checks, and a brand-new wire field has no category until it is added to `WIRE_CATEGORIES`. A changelog that mentions protocol work, or any live 400, means the validation map below decides.
+
+### 2. If the wire changed
+
+Update the affected modules using the validation map, keep `docs/wire-protocol.md` in lockstep (envelope, event table, usage/metadata), update `docs/troubleshooting.md` (required-fields list), and extend `test/provider.test.mjs` for the changed behavior. Then run `live-smoke` plus the manual checks below.
+
+### 3. Bump the pin (always)
+
+- `COMMAND_CODE_VERSION` in `constants.ts`.
+- Every version citation: `rg -n '<old-version>'` across `README.md`, `docs/*.md`, `AGENTS.md`, and source docstrings. Version claims describe the protocol this code implements; keep them current.
+- Dated observations (`catalogVersion`, row counts, hidden-row counts, "as of <date>") change only to values actually observed on that date.
+
+### Getting a bundle by hand
+
+The cache has the extracted bundle; for a version not yet fetched:
 
 ```bash
 npm i -g command-code          # or: npm pack command-code && tar -xzf command-code-*.tgz
 F=$(npm root -g)/command-code/dist/cli.mjs
 ```
 
-Everything below is a `rg` search in `"$F"` (minified single file; use wide `-{80,400}` context windows).
+Searches below are `rg` runs in `"$F"` (minified single file; use wide `-{80,400}` context windows).
 
 ### Validation map — extension area → where to check in the CLI
 
@@ -70,19 +104,22 @@ Everything below is a `rg` search in `"$F"` (minified single file; use wide `-{8
 | `index.ts` — Login flow (`oauth.login`)                                                                     | The API-key login component: browser OAuth that saves a key to `~/.commandcode/auth.json` with a manual paste fallback (`manual_entry`). Validation is `GET /alpha/whoami`: only 401 rejects; 403/unreachable keeps the key                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Plan gating knowledge                                                                                       | `GET /alpha/billing/subscriptions` → `data.planId` (e.g. `individual-go-v1`); `/alpha/billing/credits` → `credits.{purchasedCredits,freeCredits}`. The gate is the CLI's `evaluateModelAccess` ported to `plan.ts`: credits bypass everything; absent/unknown plan or unknown category (`knownCategory` — only `premium`/`opensource`) fails open; absent `minimumPlan` → category gate (go/goat get `opensource` only, `premium` from pro); explicit `null` `minimumPlan` → top-tier-only; known `minimumPlan` → rank compare over `individual-go → … → individual-ultra`, falling back to the category gate on unknown plan ids. `/provider/v1/*` **generation** endpoints are gated above the Go plan, `/provider/v1/models` is public                                                                                                                                     |
 
-### Live smoke sequence (real key, small `max_tokens`)
+### Live verification
 
-1. `GET /alpha/whoami` → 200 (key good).
-2. `GET /provider/v1/models?view=client` (with and without auth — should be identical) → count rows, diff ids against the previous run.
-3. `POST /alpha/generate` minimal text turn (the extension's own `streamSimple`, not a hand-built body — the probe script pattern from the test suite) → expect `start … finish-step finish provider-metadata`, `done`, correct usage.
-4. A turn with a tool call + tool result (verify `tool-input-*` events and stopReason `toolUse`).
-5. A vision turn: assistant `tool-call` → tool result containing an image block → the model must describe the image (verifies the image-as-user-message conversion end-to-end on a vision model, e.g. `moonshotai/Kimi-K3`).
+```bash
+CC_KEY=$(omp token commandcode-alpha) bun run live-smoke
+```
 
-### After the protocol diff
+`scripts/live-smoke.ts` runs against the live gateway through the extension's own `streamSimple`: whoami 200, catalog fetch and parse, conditional GET → 304, a minimal generate turn whose outgoing `x-command-code-version` must equal the pin, a terminal `done` with a stop reason, and reported usage. It exits non-zero on any failure.
 
-1. Update the affected modules (`stream.ts`, `messages.ts`, `session.ts`, `catalog.ts`, `discovery.ts`, `plan.ts`; `COMMAND_CODE_VERSION` in `constants.ts`).
-2. Update `docs/wire-protocol.md` (envelope, event table, usage/metadata), `docs/troubleshooting.md` (the required-fields list under 400), and README sections that quote the envelope.
-3. Extend `test/provider.test.mjs` for changed behavior; run the full gate (`check`, `lint`, `test`) plus the live smoke sequence.
+Two checks stay manual, required on any wire-change release:
+
+1. A tool-call turn: expect `tool-input-*` events and stopReason `toolUse`.
+2. A vision turn: assistant `tool-call` → tool result containing an image → the model must describe the image (verifies the image-as-user-message conversion end-to-end on a vision model, e.g. `moonshotai/Kimi-K3`).
+
+### 4. Finish
+
+Run the full gate (`bun run check`, `bun run lint`, `bun test`) and `live-smoke`. A release with no wire changes needs only the pin bump, the citation refresh, and the automated smoke.
 
 ## Design guardrails (decisions not to relitigate)
 

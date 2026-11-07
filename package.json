@@ -39,7 +39,9 @@
 		"check": "tsrs --noEmit",
 		"lint": "biome check .",
 		"format": "biome format --write .",
-		"test": "bun test"
+		"test": "bun test",
+		"wire-diff": "bun scripts/wire-diff.ts",
+		"live-smoke": "bun scripts/live-smoke.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.6.4",
