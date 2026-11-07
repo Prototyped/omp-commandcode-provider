@@ -88,12 +88,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 			if (!billing || billing.fetchFailed) return models;
-			const kept = models.filter((m) => evaluateModelAccess(billing, m).allowed);
-			const dropped = models.length - kept.length;
-			if (dropped > 0) {
-				console.error(`[commandcode-alpha] dropped ${dropped} model(s) above plan ${billing.planId}`);
-			}
-			return kept;
+			return models.filter((m) => evaluateModelAccess(billing, m).allowed);
 		},
 	});
 
